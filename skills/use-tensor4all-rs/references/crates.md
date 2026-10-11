@@ -151,6 +151,8 @@ Ports TreeTCI.jl. Cross interpolation on tree-structured graphs → TreeTN.
   distinguishes `Converged`, `MaxBondDimension`, and `MaxIterations`; convergence
   describes sampled errors, not a full-network residual bound.
 - `tensor4all_treetci::materialize::to_treetn(tci_state, batch_eval, Some(root))` — materialize as TreeTN with a batched evaluator.
+- `optimize_with_proposer` / `optimize_default` return `TreeTciOptimizationResult { ranks, errors, termination, evaluation }`; only `TreeTciTermination::Converged` is convergence (`MaxBondDimension` / `MaxIterations` are stops).
+- `TreeTciInterpolator` — implements `tensor4all_treetn::interpolation::TreeInterpolator` (validated `InterpolationProblem` with named nodes, several or zero active sites per node, absolute tolerance, bond cap, seed). Accept a result only on `InterpolationTermination::Converged`.
 
 ## tensor4all-interpolativeqtt — interpolative QTT
 
@@ -162,7 +164,9 @@ Ports InterpolativeQTT.jl; returns `SimpleTensorTrain<f64>`.
 
 Use this crate for new partitioned work on named TreeTNs. It stores eagerly
 masked `TreeTN<IdxTensor, V>` patches, supports branched topologies and multiple
-site indices per node, and does not implement adaptive interpolation.
+site indices per node, and drives adaptive patched interpolation through any
+engine implementing `tensor4all_treetn::interpolation::TreeInterpolator`
+(it implements no engine and does not depend on `tensor4all-treetci`).
 
 - `Projector` — maps full `DynIndex` identities to zero-based coordinates.
 - `SubDomainTreeTN<V>` — eagerly masked TreeTN plus its projector.
@@ -174,6 +178,45 @@ site indices per node, and does not implement adaptive interpolation.
 - `PatchSplitStrategy::{Sequential, ExactParameterGain}` — exact gain uses
   checked logical local tensor element counts after child truncation.
 - `add_with_patching(patches, &center, &options)` — split over-cap patches.
+- `adaptive_interpolation::patched_interpolate(&engine, topology, node_sites,
+  initial_pivots, evaluate, &PatchedInterpolationOptions)` — sequential tree
+  pQTCI. `evaluate` receives a column-major `[n_sites, n_points]` batch of
+  0-based full-domain points in the derived site order (nodes ascending, each
+  node's sites in order). An unaccepted patch splits at the next site of the
+  (partial) `patch_order`. `PatchedInterpolationOptions::new(max_bond_dim)`
+  (at least 2) plus `with_*` builders: `error_norm` (crate-root `ErrorNorm`;
+  default `ErrorNorm::L2 { reference: L2Reference::Required }`), `tolerance`
+  (`ErrorTolerance { rtol, atol }`, default `1e-8`, `0`), `verification`
+  (`VerificationOptions`: `samples` 64, `max_exhaustive_points` 1024,
+  `retries` 1, `audit` true), `n_initial_pivots` (5), `recycle_pivots`
+  (false), `cache_candidates` (false; children also start from their
+  largest cached values, a partial corner-miss mitigation), `seed` (0;
+  per-patch streams, no `&mut R` API), `max_patches`,
+  `min_patch_bits` (`None`; generalized bits = active sites, any dimension;
+  a blocked failing patch is retained as `PatchStatus::ToleranceNotMet`),
+  `capped_patches` (`CappedPatches::Split`; `AcceptUpTo { bits }` accepts
+  small `BondCapReached` patches on their error check, `bits >= min`).
+  Under L2 pass `ErrorNorm::l2(L2Reference::Given(l2_norm_of_f))` (an L2 norm,
+  not `max |f|`), or `rtol = 0` with `atol`; `L2Reference::MonteCarlo` is an
+  opt-in estimate. The driver measures every accepted and zero patch
+  (exhaustive up to `max_exhaustive_points`, else sampled plus audit) and
+  reports `report.norm` (`NormReport::L2 { tau, error: L2ErrorReport { global:
+  GlobalL2Error::{Certified, Audited, AcceptanceOnly, ToleranceNotMet}, ..
+  }, .. }`): `Certified` bounds the error and states that every patch met
+  its allowance, only up to a calibrated (not proven) rounding model;
+  `ToleranceNotMet` (a retained patch missed its allowance; check
+  `report.tolerance_met()`) still bounds the error with an
+  `ExactOrExhaustive` basis but is never certified; a sampled run is an estimate only with the audit on, otherwise
+  acceptance-only (neither a bound nor an estimate). Known limitation:
+  sampled acceptance and the audit can both miss a localized feature that
+  enters a patch only through a corner or an edge, and the audit's standard
+  error does not reveal it, so an `Audited` error can be orders of magnitude
+  too small; only `Certified` (exact or exhaustive) is a guarantee. `ErrorNorm::sampled_max()` /
+  `sampled_max_with_reference(max_abs)` keep the M2 engine criterion (no
+  certified bound, no measured error, no L2 claim). `MaxAbs`/`WeightedL2` are placeholders
+  (`UnsupportedNorm`). Zero patches are in `report.zero_patches` (absent from
+  the partition); supply pivots in the support of sparse functions. Patches
+  with at most one free site are exact; every point is evaluated at most once.
 - `truncate_adaptive(&partition, &center, cutoff, max_bond_dim)` — assign
   volume-proportional absolute local cutoffs and drop patches at/below theirs.
 - `contract_adaptive(&left, &right, &center, &contract_options, &patching_options)` —
