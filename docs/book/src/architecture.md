@@ -28,6 +28,8 @@ facade, and each crate can be used on its own.
               |
    tensor4all-treetci
 
+   tensor4all-treersi -> tensor4all-treetn (experimental RSI products)
+
    tensor4all-capi  (C FFI for language bindings; depends on both stacks)
    tensor4all-hdf5  (MPS serialization, ITensors.jl-compatible)
 ```
@@ -164,6 +166,7 @@ requirements onto unrelated generic code.
 | **itensorlike** | ITensors.jl-inspired `TensorTrain` (tree-based) with orthogonality tracking and multiple canonical forms. |
 | **partitionedtreetn** | TreeTN-native eagerly masked subdomains, strict partition algebra, volume-budgeted adaptive patching, sequential adaptive patched interpolation through any `TreeInterpolator` engine, reconstruction against a fixed global L2 tolerance, and level-coupled merge-refine QFT scheduling. |
 | **partitionedtt** | **Deprecated** partitioned tensor trains for subdomain decomposition. Builds on itensorlike and crosses to simplett via `simplett_bridge`; it remains buildable during migration. |
+| **treersi** | Experimental CPU Hadamard products on TreeTN via recursive sketched interpolation; requires independent accuracy checks. |
 | **treetci** | Tree TCI: cross interpolation on tree-structured tensor networks; `TreeTciInterpolator` implements the `TreeInterpolator` engine trait. |
 
 ### Simplett stack
@@ -203,6 +206,7 @@ requirements onto unrelated generic code.
 |------|-------------------|
 | TCI on a black-box function (high level) | `tensor4all-quanticstci` |
 | TCI with fine-grained control | `tensor4all-tensorci` |
+| Sketched Hadamard products of existing TreeTNs | [`tensor4all-treersi`](guides/tree-rsi.md) (experimental) |
 | Tree TCI | `tensor4all-treetci` |
 | Simple positional tensor train (create, evaluate, compress) | `tensor4all-simplett` (`SimpleTensorTrain`) |
 | Tensor train with ITensors.jl-style interface | `tensor4all-itensorlike` (`TensorTrain`) |
