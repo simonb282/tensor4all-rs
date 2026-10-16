@@ -617,11 +617,22 @@ where
     ///    - Contract right factor into parent tensor
     /// 4. Contract the final center tensors
     ///
+    /// # Truncation
+    /// Each factorization in step 3 truncates a local block that still carries
+    /// the open bonds of both input networks towards the center, so its rank
+    /// can exceed the rank of the exact result across the same edge. A
+    /// `max_bond_dim` equal to the exact result's bond dimension can therefore
+    /// discard non-negligible weight; zip-up is exact only when the cap also
+    /// covers these intermediate ranks (at most the product of the two input
+    /// networks' bond dimensions on that edge). For a cap
+    /// at or near the final rank, use fit or SRC contraction instead.
+    ///
     /// # Arguments
     /// * `other` - The other TreeTN to contract with (must have same topology)
     /// * `center` - The center node name towards which to contract
     /// * `svd_policy` - Optional SVD truncation policy
-    /// * `max_bond_dim` - Optional maximum bond dimension
+    /// * `max_bond_dim` - Optional maximum bond dimension, applied to every
+    ///   intermediate factorization (see "Truncation")
     ///
     /// # Returns
     /// The contracted TreeTN result, or an error if topologies don't match or contraction fails.
@@ -1839,7 +1850,9 @@ use super::fit::FitContractionOptions;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContractionMethod {
-    /// Zip-up contraction (faster, one-pass).
+    /// Zip-up contraction (faster, one-pass). Its `max_bond_dim` caps the
+    /// intermediate factorizations, whose ranks can exceed the final rank;
+    /// see [`TreeTN::contract_zipup`].
     #[default]
     Zipup,
     /// Fit/variational contraction (iterative optimization).
