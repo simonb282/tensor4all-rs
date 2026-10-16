@@ -119,7 +119,11 @@ To apply an operator, bind those abstract indices to the concrete site indices
 of the target state, then call `apply_linear_operator`. When the target
 TreeTN's quantics sites are tagged as `x=1`, `x=2`, ..., use
 `apply_linear_operator_to_numbered_tags`; otherwise use explicit index binding
-with `apply_linear_operator_to_indices`.
+with `apply_linear_operator_to_indices`. The numbered-tag helper binds each
+numbered tag to the operator mapping on the state node that holds the tagged
+leg, so the operator's node names must match the state's node names (rename the
+operator otherwise). When one node holds several tagged legs, the tags bind in
+ascending numeric order to that node's mapping order.
 
 ```text
 Original TreeTN          Operator            Result TreeTN

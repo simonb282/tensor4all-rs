@@ -503,7 +503,7 @@ where
                 .tensor(node_idx_other)
                 .ok_or_else(|| anyhow::anyhow!("Tensor not found for node {:?}", node_name))
                 .context("inner: other tensor must exist")?;
-            env = T::contract(&[&env, other_tensor])
+            env = super::contract_or_outer_product(&env, other_tensor)
                 .context("inner: failed to contract node bra-ket tensors")?;
 
             envs.insert(node_name, env);

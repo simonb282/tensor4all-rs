@@ -17,6 +17,7 @@ mod f7_zipup_context;
 mod fit_sum;
 mod gse;
 mod issue192_regression;
+mod issue695_zipup_max_rank;
 mod linsolve;
 mod linsolve_mpo_xb;
 mod ops;

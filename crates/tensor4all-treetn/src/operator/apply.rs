@@ -572,16 +572,26 @@ where
 /// The selected state indices are resolved with
 /// [`TreeTN::external_indices_with_numbered_tag`]. For example,
 /// `tag_prefix = "k"` and `start_index = 1` selects `"k=1"`, `"k=2"`, ...
-/// in operator node order. The number of selected tags is inferred from the
-/// operator's true input mappings, so this helper works for any operator whose
-/// input and output mapping counts match.
+/// in ascending numeric tag order. The number of selected tags is inferred
+/// from the operator's true input mappings, so this helper works for any
+/// operator whose input and output mapping counts match.
+///
+/// Each selected state index is bound to the operator mapping declared on the
+/// **same state node** that holds the index. The operator's MPO node names must
+/// therefore match the state's node names; rename the operator otherwise. A
+/// selected index on a node without an operator mapping is rejected. When one
+/// node holds several selected tags, the tags are paired, in ascending numeric
+/// order, with that node's mapping vector order (the order returned by
+/// [`LinearOperator::get_input_mappings`] and
+/// [`LinearOperator::get_output_mappings`]).
 ///
 /// The result keeps the selected state indices as the operator output indices.
 /// If a transform should write to different output indices, use
 /// [`apply_linear_operator_to_indices`] and pass explicit output bindings.
 ///
 /// # Arguments
-/// * `operator` - Operator to apply. Its node order defines the bit order.
+/// * `operator` - Operator to apply. Its node names and per-node mapping counts
+///   define the binding for each selected state leg.
 /// * `state` - State containing numbered-tagged external indices.
 /// * `tag_prefix` - Prefix before the equals sign, such as `"k"` or `"x"`.
 /// * `start_index` - First numbered tag to select. Use `1` for Quantics.jl-style
@@ -594,8 +604,16 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error when a numbered tag is ambiguous or missing (a
-/// missing-index failure) or the application fails (a backend failure).
+/// Returns [`LinearOperatorTaggedApplyError::SelectTaggedIndices`] when a
+/// numbered tag is ambiguous or missing,
+/// [`LinearOperatorTaggedApplyError::MappingCountMismatch`] when the total input
+/// and output mapping counts differ,
+/// [`LinearOperatorTaggedApplyError::MissingNodeMapping`] when a selected
+/// index's node has no operator input or output mapping, and
+/// [`LinearOperatorTaggedApplyError::SelectedTagCountMismatch`] when a node's
+/// selected tag count differs from that node's input or output mapping count.
+/// Failures inside the underlying application are returned through
+/// [`LinearOperatorTaggedApplyError::ApplyToIndices`].
 ///
 /// # Examples
 /// ```
@@ -652,28 +670,8 @@ pub fn apply_linear_operator_to_numbered_tags<V>(
 where
     V: Clone + Hash + Eq + Ord + Send + Sync + std::fmt::Debug,
 {
-    let input_true_indices = true_indices_in_operator_node_order(operator, &operator.input_mapping);
-    let output_true_indices =
-        true_indices_in_operator_node_order(operator, &operator.output_mapping);
-
-    if input_true_indices.len() != output_true_indices.len() {
-        return Err(LinearOperatorTaggedApplyError::MappingCountMismatch {
-            input_count: input_true_indices.len(),
-            output_count: output_true_indices.len(),
-        });
-    }
-
-    let state_indices = state.external_indices_with_numbered_tag(
-        tag_prefix,
-        start_index,
-        input_true_indices.len(),
-    )?;
-    let input_pairs: Vec<(DynIndex, DynIndex)> = input_true_indices
-        .into_iter()
-        .zip(state_indices.iter().cloned())
-        .collect();
-    let output_pairs: Vec<(DynIndex, DynIndex)> =
-        output_true_indices.into_iter().zip(state_indices).collect();
+    let (input_pairs, output_pairs) =
+        bind_numbered_tags_to_operator_nodes(operator, state, tag_prefix, start_index)?;
 
     Ok(apply_linear_operator_to_indices(
         operator,
@@ -684,22 +682,117 @@ where
     )?)
 }
 
-fn true_indices_in_operator_node_order<V>(
+/// Bind numbered-tagged state indices to operator mappings by node identity.
+///
+/// Each selected state index is matched to its owning state node and bound to
+/// that node's operator input/output mapping at the same within-node position
+/// as the tag's position in the node's selected-tag group. Selected tags are
+/// grouped in ascending numeric tag order, which is the only order available
+/// for the node's mapping vector.
+#[allow(clippy::type_complexity)]
+fn bind_numbered_tags_to_operator_nodes<V>(
     operator: &LinearOperator<IdxTensor, V>,
-    mappings_by_node: &HashMap<V, Vec<IndexMapping<DynIndex>>>,
-) -> Vec<DynIndex>
+    state: &TreeTN<IdxTensor, V>,
+    tag_prefix: &str,
+    start_index: usize,
+) -> std::result::Result<
+    (Vec<(DynIndex, DynIndex)>, Vec<(DynIndex, DynIndex)>),
+    LinearOperatorTaggedApplyError,
+>
 where
     V: Clone + Hash + Eq + Ord + Send + Sync + std::fmt::Debug,
 {
-    let mut nodes = operator.mpo().node_names();
-    nodes.sort();
-    let mut indices = Vec::new();
-    for node in nodes {
-        if let Some(mappings) = mappings_by_node.get(&node) {
-            indices.extend(mappings.iter().map(|mapping| mapping.true_index.clone()));
+    let input_count: usize = operator.input_mappings().values().map(Vec::len).sum();
+    let output_count: usize = operator.output_mappings().values().map(Vec::len).sum();
+    if input_count != output_count {
+        return Err(LinearOperatorTaggedApplyError::MappingCountMismatch {
+            input_count,
+            output_count,
+        });
+    }
+
+    let state_indices =
+        state.external_indices_with_numbered_tag(tag_prefix, start_index, input_count)?;
+
+    // The k-th selected index carries the tag `start_index + k`. Group the
+    // selected indices by the state node whose site space holds them, in
+    // ascending tag order within each node, and order the groups by their
+    // first tag so errors are reported deterministically.
+    let positions: HashMap<&DynIndex, usize> = state_indices
+        .iter()
+        .enumerate()
+        .map(|(position, index)| (index, position))
+        .collect();
+    let mut groups: Vec<(usize, V, Vec<usize>)> = Vec::new();
+    for node in state.node_names() {
+        let Some(space) = state.site_space(&node) else {
+            continue;
+        };
+        let mut group: Vec<usize> = space
+            .iter()
+            .filter_map(|index| positions.get(index).copied())
+            .collect();
+        group.sort_unstable();
+        if let Some(&first) = group.first() {
+            groups.push((first, node, group));
         }
     }
-    indices
+    groups.sort_unstable_by_key(|(first, _, _)| *first);
+
+    let mut input_pairs = Vec::with_capacity(input_count);
+    let mut output_pairs = Vec::with_capacity(output_count);
+    let mut selected_by_node: HashMap<V, usize> = HashMap::with_capacity(groups.len());
+    for (first, node, group) in groups {
+        let missing = |role| LinearOperatorTaggedApplyError::MissingNodeMapping {
+            role,
+            tag: format!("{tag_prefix}={}", start_index + first),
+            node: format!("{node:?}"),
+        };
+        let inputs = operator
+            .input_mappings()
+            .get(&node)
+            .ok_or_else(|| missing("input"))?;
+        let outputs = operator
+            .output_mappings()
+            .get(&node)
+            .ok_or_else(|| missing("output"))?;
+        // Per-node counts are validated below; a short zip only happens on a
+        // mismatch, whose pairs are then discarded with the error.
+        for ((position, input), output) in group.iter().zip(inputs).zip(outputs) {
+            let index = &state_indices[*position];
+            input_pairs.push((input.true_index.clone(), index.clone()));
+            output_pairs.push((output.true_index.clone(), index.clone()));
+        }
+        selected_by_node.insert(node, group.len());
+    }
+
+    validate_selected_tag_counts(operator.input_mappings(), &selected_by_node, "input")?;
+    validate_selected_tag_counts(operator.output_mappings(), &selected_by_node, "output")?;
+
+    Ok((input_pairs, output_pairs))
+}
+
+/// Reject a node whose number of selected tags differs from its mapping count.
+fn validate_selected_tag_counts<V>(
+    mappings_by_node: &HashMap<V, Vec<IndexMapping<DynIndex>>>,
+    selected_by_node: &HashMap<V, usize>,
+    role: &'static str,
+) -> std::result::Result<(), LinearOperatorTaggedApplyError>
+where
+    V: Clone + Hash + Eq + Ord + Send + Sync + std::fmt::Debug,
+{
+    for (node, mappings) in mappings_by_node {
+        let selected = selected_by_node.get(node).copied().unwrap_or(0);
+        if selected != mappings.len() {
+            return Err(LinearOperatorTaggedApplyError::SelectedTagCountMismatch {
+                role,
+                node: format!("{node:?}"),
+                selected,
+                mappings: mappings.len(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn replace_mapping_true_indices<I, V>(

@@ -106,6 +106,25 @@ fn tagged_apply_error_messages_are_stable() {
         "operator has 2 input mappings but 3 output mappings"
     );
     assert_eq!(
+        LinearOperatorTaggedApplyError::MissingNodeMapping {
+            role: "input",
+            tag: "k=3".to_string(),
+            node: "\"site\"".to_string(),
+        }
+        .to_string(),
+        "state index tagged k=3 on state node \"site\" has no operator input mapping; operator node names must match the state node names"
+    );
+    assert_eq!(
+        LinearOperatorTaggedApplyError::SelectedTagCountMismatch {
+            role: "input",
+            node: "\"site\"".to_string(),
+            selected: 2,
+            mappings: 1,
+        }
+        .to_string(),
+        "state node \"site\" has 2 selected tag(s) but 1 operator input mapping(s)"
+    );
+    assert_eq!(
         LinearOperatorTaggedApplyError::ApplyToIndices(
             LinearOperatorIndexApplyError::ApplyFailed {
                 message: "apply failed".to_string(),

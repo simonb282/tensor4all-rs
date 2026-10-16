@@ -380,23 +380,15 @@ where
             .cloned()
             .collect();
 
-        if left_inds.is_empty() && current_indices.len() > 1 {
-            // This indicates an inconsistent topology specification for the current tensor.
-            // Previously we "skipped" such nodes, but that can lead to missing tensors and
-            // panics later when building the TreeTN.
-            return Err(anyhow::anyhow!(
-                "No physical indices found for node {:?} (requested indices={:?}) in current tensor indices={:?}",
-                node,
-                node_indices,
-                current_indices
-            ));
-        }
-
         // Perform factorization using TensorFactorizationLike::factorize
         // left will have the node's physical indices + bond index
-        // right will have bond index + remaining indices
-        let factorize_result = leaves
-            .factorize(&current_tensor, &left_inds, &factorize_options)
+        // right will have bond index + remaining indices. A site-free node
+        // asks for an empty left side; `factorize_allowing_empty_side` is the
+        // single place where that empty-side split is handled.
+        let factorize_result =
+            super::factorize_allowing_empty_side(&current_tensor, &left_inds, |tensor, left| {
+                leaves.factorize(tensor, left, &factorize_options)
+            })
             .map_err(|e| anyhow::anyhow!("Factorization failed: {:?}", e))?;
 
         let left_indices = factorize_result.left.external_indices();

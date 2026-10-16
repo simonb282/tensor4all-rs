@@ -7,13 +7,16 @@
 //! each network once and compares it with a dense reference via `maxabs()`.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use num_complex::Complex64;
 use tensor4all_core::{DynIndex, IdxTensor, IndexLike, TagSet, TensorContractionLike, TensorIndex};
 use tensor4all_treetn::contraction::{contract, ContractionOptions};
 use tensor4all_treetn::{
-    factorize_tensor_to_treetn, fit_sum, CanonicalForm, CanonicalizationOptions, FitOptions,
-    SwapOptions, TreeTN, TreeTopology, TruncationOptions,
+    dmrg, factorize_tensor_to_treetn, fit_sum, global_subspace_expand_with_references, tdvp,
+    CanonicalForm, CanonicalizationOptions, DmrgError, DmrgOptions, FitOptions, GseError,
+    GseOptions, IndexMapping, LinearOperator, SiteIndexNetwork, SplitOptions, SwapOptions,
+    TdvpError, TdvpOptions, TreeTN, TreeTopology, TruncationOptions,
 };
 
 type Network = TreeTN<IdxTensor, String>;
@@ -512,6 +515,74 @@ fn site_free_y_contraction_pair() -> (Network, Network) {
     (state, operator)
 }
 
+/// A star around a **site-free** hub `m` whose three leaves carry sites:
+///
+/// ```text
+/// a - m - b
+///     |
+///     c
+/// ```
+///
+/// Exercises the internal site-free node of the tree SRC path, whose
+/// messages get the batch axis from the incoming leaf messages.
+fn site_free_hub_contraction_pair() -> (Network, Network) {
+    let sites: Vec<DynIndex> = (0..3).map(|_| DynIndex::new_dyn(2)).collect();
+    let outputs: Vec<DynIndex> = (0..3).map(|_| DynIndex::new_dyn(2)).collect();
+    let build = |with_outputs: bool, seed: f64| {
+        let bonds: Vec<DynIndex> = (0..3).map(|_| DynIndex::new_dyn(2)).collect();
+        let mut tensors: Vec<IdxTensor> = (0..3)
+            .map(|leaf| {
+                let mut indices = vec![sites[leaf].clone()];
+                if with_outputs {
+                    indices.push(outputs[leaf].clone());
+                }
+                indices.push(bonds[leaf].clone());
+                let len = indices.iter().map(|index| index.dim()).product();
+                dense(
+                    indices,
+                    &sample_values(len, seed + 0.37 * leaf as f64),
+                    None,
+                )
+            })
+            .collect();
+        tensors.push(dense(bonds, &sample_values(8, seed + 1.9), None));
+        TreeTN::from_tensors(tensors, names(&["a", "b", "c", "m"])).unwrap()
+    };
+    let state = build(false, 0.4);
+    let operator = build(true, 0.9);
+    assert!(is_site_free(&state, &"m".to_string()));
+    assert!(is_site_free(&operator, &"m".to_string()));
+    (state, operator)
+}
+
+#[test]
+fn src_contraction_with_site_free_hub_matches_dense_reference() {
+    let (state, operator) = site_free_hub_contraction_pair();
+    let expected = state
+        .to_dense()
+        .unwrap()
+        .contract_pair(&operator.to_dense().unwrap())
+        .unwrap();
+    for center in state.node_names() {
+        let result = contract(
+            &state,
+            &operator,
+            &center,
+            ContractionOptions::src().with_max_bond_dim(16),
+        )
+        .unwrap();
+        assert_values(&result, &expected, &format!("SRC to {center}"));
+    }
+}
+
+#[test]
+fn inner_with_site_free_hub_matches_dense_reference() {
+    let (state, _) = site_free_hub_contraction_pair();
+    let expected = state.to_dense().unwrap().norm().unwrap().powi(2);
+    let inner = state.inner(&state).unwrap();
+    assert!((inner.real() - expected).abs() <= EXACT_TOL * expected);
+}
+
 /// Run `contract_fit` towards every center, as the zip-up initializer alone
 /// (`nfullsweeps = 0`) and with variational sweeps, and compare each result
 /// with the dense contraction.
@@ -669,11 +740,10 @@ fn lu_and_ci_canonicalization_preserve_zero_tensor_value() {
 }
 
 // ============================================================================
-// Known failures with site-free nodes, tracked in issue #797
+// Operations on site-free nodes
 // ============================================================================
 
 #[test]
-#[ignore = "known bug, tracked in #797: inner fails with \"Disconnected tensor network\" on site-free nodes"]
 fn inner_with_site_free_leaf_matches_dense_reference() {
     let x = direct_sum_network(false);
     let expected = x.to_dense().unwrap().norm().unwrap().powi(2);
@@ -682,7 +752,6 @@ fn inner_with_site_free_leaf_matches_dense_reference() {
 }
 
 #[test]
-#[ignore = "known bug, tracked in #797: SRC contraction fails on site-free nodes"]
 fn src_contraction_with_site_free_leaf_matches_dense_reference() {
     let (state, operator) = site_free_contraction_pair();
     let expected = state
@@ -703,7 +772,6 @@ fn src_contraction_with_site_free_leaf_matches_dense_reference() {
 }
 
 #[test]
-#[ignore = "known bug, tracked in #797: factorize_tensor_to_treetn rejects site-free nodes"]
 fn factorize_tensor_to_treetn_with_site_free_leaf_matches_dense_reference() {
     let (site_a, site_b) = (DynIndex::new_dyn(2), DynIndex::new_dyn(2));
     let expected = dense(
@@ -726,4 +794,138 @@ fn factorize_tensor_to_treetn_with_site_free_leaf_matches_dense_reference() {
         let tn = factorize_tensor_to_treetn(&expected, &topology, &root.to_string()).unwrap();
         assert_values(&tn, &expected, &format!("decompose from {root}"));
     }
+}
+
+/// A node that requests a site index the tensor does not carry is an
+/// inconsistent topology, not a site-free node: the up-front topology check
+/// rejects it before any empty-side factorization.
+#[test]
+fn factorize_tensor_to_treetn_rejects_requested_index_missing_from_tensor() {
+    let (site_a, site_b) = (DynIndex::new_dyn(2), DynIndex::new_dyn(2));
+    let tensor = dense(
+        vec![site_a.clone(), site_b.clone()],
+        &sample_values(4, 0.9),
+        None,
+    );
+    let topology = TreeTopology::new(
+        HashMap::from([
+            ("a".to_string(), vec![site_a]),
+            ("b".to_string(), vec![site_b.prime()]),
+        ]),
+        vec![("a".to_string(), "b".to_string())],
+    );
+    for root in ["a", "b"] {
+        let error = factorize_tensor_to_treetn(&tensor, &topology, &root.to_string()).unwrap_err();
+        assert!(
+            error.to_string().contains("not found in tensor"),
+            "root {root}: unexpected error: {error}"
+        );
+    }
+}
+
+// ============================================================================
+// Single-site sweeps reject site-free states
+// ============================================================================
+
+/// `e - a - b` with the site-free `e` inserted first, so the single-site
+/// sweep validators reach it before any node that carries a site.
+fn state_with_site_free_node_first() -> Network {
+    let (site_a, site_b) = (DynIndex::new_dyn(2), DynIndex::new_dyn(2));
+    let (bond_ea, bond_ab) = (DynIndex::new_dyn(2), DynIndex::new_dyn(2));
+    TreeTN::from_tensors(
+        vec![
+            dense(vec![bond_ea.clone()], &[1.0, 1.0], None),
+            dense(
+                vec![bond_ea, site_a, bond_ab.clone()],
+                &sample_values(8, 0.5),
+                None,
+            ),
+            dense(vec![bond_ab, site_b], &sample_values(4, 0.9), None),
+        ],
+        names(&["e", "a", "b"]),
+    )
+    .unwrap()
+}
+
+#[test]
+fn dmrg_rejects_state_with_site_free_node() {
+    let state = state_with_site_free_node_first();
+    // The operator only has to share the state graph: the validator rejects the
+    // site-free state node before it reads any mapping.
+    let operator = LinearOperator::new(
+        state.clone(),
+        HashMap::<String, IndexMapping<DynIndex>>::new(),
+        HashMap::<String, IndexMapping<DynIndex>>::new(),
+    );
+    let err = dmrg(&operator, state, &"a".to_string(), DmrgOptions::default()).unwrap_err();
+    assert!(matches!(
+        err,
+        DmrgError::UnsupportedStateSiteCount { node, count }
+            if node == "\"e\"" && count == 0
+    ));
+}
+
+#[test]
+fn tdvp_rejects_state_with_site_free_node() {
+    let state = state_with_site_free_node_first();
+    let operator = LinearOperator::new(
+        state.clone(),
+        HashMap::<String, IndexMapping<DynIndex>>::new(),
+        HashMap::<String, IndexMapping<DynIndex>>::new(),
+    );
+    let err = tdvp(&operator, state, &"a".to_string(), TdvpOptions::default()).unwrap_err();
+    assert!(matches!(
+        err,
+        TdvpError::UnsupportedStateSiteCount { node, count }
+            if node == "\"e\"" && count == 0
+    ));
+}
+
+#[test]
+fn gse_rejects_state_with_site_free_node() {
+    let state = state_with_site_free_node_first();
+    let err = global_subspace_expand_with_references(
+        state,
+        Vec::new(),
+        &"a".to_string(),
+        GseOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        GseError::UnsupportedStateSiteCount { node, count }
+            if node == "\"e\"" && count == 0
+    ));
+}
+
+#[test]
+fn split_to_rejects_site_free_current_node() {
+    // A site-free current node has no site index that can be assigned to a
+    // target node, so `split_to` reports it instead of silently dropping it.
+    let site_a = DynIndex::new_dyn(2);
+    let bond_ae = DynIndex::new_dyn(2);
+    let tn: Network = TreeTN::from_tensors(
+        vec![
+            dense(
+                vec![site_a.clone(), bond_ae.clone()],
+                &sample_values(4, 0.5),
+                None,
+            ),
+            dense(vec![bond_ae], &[1.0, 1.0], None),
+        ],
+        names(&["a", "e"]),
+    )
+    .unwrap();
+    assert!(is_site_free(&tn, &"e".to_string()));
+
+    let mut target = SiteIndexNetwork::<String, DynIndex>::new();
+    target
+        .add_node("a".to_string(), HashSet::from([site_a]))
+        .unwrap();
+
+    let err = tn.split_to(&target, &SplitOptions::default()).unwrap_err();
+    assert!(
+        err.to_string().contains('e'),
+        "split_to must name the site-free node it cannot place: {err}"
+    );
 }

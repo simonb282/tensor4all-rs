@@ -275,13 +275,15 @@ fn fit_context_route_matches_plain_route() {
 }
 
 /// Regression for the index-identity rule on the Naive route: same-ID indices
-/// that differ by prime level are never conflated. The primed middle site
-/// leaves the dense-reference decomposition without a physical index for the
-/// node (the two same-ID indices differ only in prime level), so both routes
-/// refuse the shape - a route that conflated the primed index with its
-/// unprimed twin would instead succeed.
+/// that differ by prime level are never conflated.
+///
+/// Contracting over `s0` and `s2` leaves the end nodes site-free (supported
+/// since #797), and the middle node keeps both `s1` and the primed `s1'`, so
+/// the result has 2 x 2 = 4 entries. A route that conflated `s1'` with `s1`
+/// would contract it away as well and leave a single scalar entry. Both
+/// routes must agree.
 #[test]
-fn naive_context_route_refuses_same_id_primed_indices_like_the_plain_route() {
+fn naive_context_route_keeps_same_id_primed_indices_like_the_plain_route() {
     let sites: Vec<DynIndex> = (0..3).map(|_| DynIndex::new_dyn(2)).collect();
     let primed_sites: Vec<DynIndex> =
         vec![sites[0].clone(), sites[1].clone().prime(), sites[2].clone()];
@@ -294,7 +296,7 @@ fn naive_context_route_refuses_same_id_primed_indices_like_the_plain_route() {
         &mpo(&primed_sites, 4, &global_build),
         &options,
     )
-    .unwrap_err();
+    .unwrap();
 
     let context = one_thread_context();
     let build = in_context_build(&context);
@@ -304,68 +306,22 @@ fn naive_context_route_refuses_same_id_primed_indices_like_the_plain_route() {
         &options,
         &context,
     )
-    .unwrap_err();
-
-    let (plain_message, contextual_message) = (format!("{plain}"), format!("{contextual}"));
-    assert!(
-        plain_message.contains("physical indices"),
-        "expected the primed shape to be refused for a missing physical index, got: {plain_message}"
-    );
-    assert!(
-        contextual_message.contains("physical indices"),
-        "the caller-owned route must refuse the primed shape the same way, got: {contextual_message}"
-    );
-}
-
-/// Regression for the index-identity rule on the Fit route: same-ID indices
-/// that differ by prime level are not conflated.
-///
-/// The plain route factorizes the primed shape and its result differs from the
-/// same-prime-level result, so the primed index is demonstrably not conflated
-/// with its unprimed twin. The caller-owned route refuses the same shape with a
-/// typed factorization error (its documented refusal contract, recorded in
-/// `docs/worklogs/2026-10-12-f7-treetn-fit-context.md`): refusing beats
-/// conflating, which would have made the two results equal.
-#[test]
-fn fit_context_route_handles_same_id_primed_indices_like_the_plain_route() {
-    let sites: Vec<DynIndex> = (0..3).map(|_| DynIndex::new_dyn(2)).collect();
-    let primed_sites: Vec<DynIndex> =
-        vec![sites[0].clone(), sites[1].clone().prime(), sites[2].clone()];
-    let options = ContractOptions::fit().with_max_bond_dim(8).with_nsweeps(2);
-
-    let same_plev = contract(
-        &mpo(&sites, 1, &global_build),
-        &mpo(&sites, 4, &global_build),
-        &options,
-    )
-    .unwrap();
-    let primed_plain = contract(
-        &mpo(&sites, 1, &global_build),
-        &mpo(&primed_sites, 4, &global_build),
-        &options,
-    )
     .unwrap();
 
-    // Distinctness: the primed middle site is not conflated with the unprimed
-    // one, so the result differs from the same-prime-level contraction.
-    assert_ne!(dense(&same_plev), dense(&primed_plain));
-
-    // Documented divergence: the caller-owned route rejects this primed shape
-    // (its factorization path refuses the unpaired primed site) instead of
-    // conflating it with the unprimed twin - a typed error, recorded in
-    // docs/worklogs/2026-10-12-f7-treetn-fit-context.md.
-    let context = one_thread_context();
-    let build = in_context_build(&context);
-    let error = contract_in(
-        &mpo(&sites, 1, &build),
-        &mpo(&primed_sites, 4, &build),
-        &options,
-        &context,
-    )
-    .unwrap_err();
+    let (a, b) = (dense(&plain), dense(&contextual));
+    assert_eq!(a.len(), 4, "the primed middle site must not be conflated");
+    assert_eq!(b.len(), 4, "the primed middle site must not be conflated");
+    let difference: f64 = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let reference: f64 = a.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
+    let residual = difference / reference.max(1e-30);
     assert!(
-        format!("{error}").contains("factorization"),
-        "expected the caller-owned route to refuse the primed shape, got: {error}"
+        residual <= 1e-10,
+        "naive context route residual {residual} exceeds 1e-10"
     );
 }
 

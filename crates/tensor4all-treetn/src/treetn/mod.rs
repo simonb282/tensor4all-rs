@@ -161,6 +161,37 @@ where
     ))
 }
 
+/// Contract two local tensors that may share no index.
+///
+/// A site-free node's bra and ket tensors carry only bond indices, and the two
+/// copies use distinct bond indices, so they share nothing even though they
+/// belong to the same node. Tensor4all-core's connected-contraction contract
+/// rejects that intentional disconnected product, so the owning algorithm must
+/// make the outer product explicit here instead of relaxing the core contract
+/// or catching its disconnected-network error. This is the local-pair
+/// companion of [`factorize_allowing_empty_side`]: when the two tensors share
+/// at least one index the ordinary connected contraction is used, so a node
+/// with sites follows the previous path unchanged.
+///
+/// # Errors
+///
+/// Returns the error of `outer_product` when the tensors share nothing, or
+/// the error of `contract` when they do.
+fn contract_or_outer_product<T>(lhs: &T, rhs: &T) -> Result<T>
+where
+    T: TensorLike,
+{
+    let shared = tensor4all_core::index_ops::common_inds::<T::Index>(
+        &lhs.external_indices(),
+        &rhs.external_indices(),
+    );
+    if shared.is_empty() {
+        lhs.outer_product(rhs).map_err(anyhow::Error::from)
+    } else {
+        T::contract(&[lhs, rhs]).map_err(anyhow::Error::from)
+    }
+}
+
 /// Tree Tensor Network structure (inspired by ITensorNetworks.jl's TreeTensorNetwork).
 /// Maintains a graph of tensors connected by bonds (edges).
 /// Each node stores a tensor, and edges store `Connection` objects
