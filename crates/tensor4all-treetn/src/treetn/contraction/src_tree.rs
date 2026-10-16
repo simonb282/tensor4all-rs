@@ -184,7 +184,15 @@ where
             let factor = T::ones_in(context, std::slice::from_ref(&cap)).map_err(|error| {
                 anyhow::anyhow!("contract_src: scalar tree cap construction failed: {error}")
             })?;
-            let source = contract_factors(&source_factors, "contract_src: scalar tree source")?;
+            let source = merge_local_pair(
+                tensor_a,
+                tensor_b,
+                projected_children
+                    .get(child)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                "contract_src: scalar tree source",
+            )?;
             let projected = source.outer_product(&factor).map_err(|error| {
                 anyhow::anyhow!("contract_src: scalar tree projection failed: {error}")
             })?;
@@ -407,6 +415,7 @@ where
             self.local,
             &probe_batches,
             &batch,
+            self.context,
         )?;
         let environment = directed
             .get(&(parent.clone(), child.clone()))
@@ -468,6 +477,7 @@ where
             self.local,
             &probe_batches,
             &batch,
+            self.context,
         )?;
         self.segments.push((start, width, batch, directed));
         self.segment_total_width = next_total_width;
@@ -590,13 +600,34 @@ fn merge_projected<T>(tensor_a: &T, tensor_b: &T, projected: Option<&[T]>) -> Re
 where
     T: TensorLike,
 {
-    let mut factors = Vec::with_capacity(projected.map_or(2, |items| items.len() + 2));
+    merge_local_pair(
+        tensor_a,
+        tensor_b,
+        projected.unwrap_or(&[]),
+        "contract_src: projected local merge",
+    )
+}
+
+/// Contract a node's two local operands together with any already-projected
+/// child bridges.
+///
+/// Projected bridges connect the two operands, so they keep the n-ary
+/// contraction; without bridges a site-free node's operands share no index and
+/// [`contract_or_outer_product`](crate::treetn::contract_or_outer_product)
+/// makes their product explicit.
+fn merge_local_pair<T>(tensor_a: &T, tensor_b: &T, rest: &[T], context: &str) -> Result<T>
+where
+    T: TensorLike,
+{
+    if rest.is_empty() {
+        return crate::treetn::contract_or_outer_product(tensor_a, tensor_b)
+            .map_err(|error| anyhow::anyhow!("{context}: {error}"));
+    }
+    let mut factors: Vec<&T> = Vec::with_capacity(2 + rest.len());
     factors.push(tensor_a);
     factors.push(tensor_b);
-    if let Some(projected) = projected {
-        factors.extend(projected.iter());
-    }
-    contract_factors(&factors, "contract_src: projected local merge")
+    factors.extend(rest.iter());
+    T::contract(&factors).map_err(|error| anyhow::anyhow!("{context}: {error}"))
 }
 
 fn site_factors<'a, T>(tensor_a: &'a T, tensor_b: &'a T, projected: Option<&'a [T]>) -> Vec<&'a T>
@@ -649,17 +680,6 @@ where
     result
 }
 
-fn contract_factors<T>(factors: &[&T], context: &str) -> Result<T>
-where
-    T: TensorLike,
-{
-    match factors {
-        [] => anyhow::bail!("{context}: no tensors to contract"),
-        [single] => Ok((*single).clone()),
-        _ => T::contract(factors).map_err(|error| anyhow::anyhow!("{context}: {error}")),
-    }
-}
-
 fn edge_bonds<T, V>(
     tn_a: &TreeTN<T, V>,
     tn_b: &TreeTN<T, V>,
@@ -688,12 +708,38 @@ where
     Ok((bond_a, bond_b))
 }
 
+/// Combine a leaf's two local operands and broadcast the retained batch axis
+/// into its message.
+///
+/// The leaf has no output legs, so no probe carries `batch`. For a site-free
+/// leaf the two operands share no index and are combined with an explicit
+/// outer product of their single bonds, which stays small.
+fn leaf_batched_local_pair<T>(
+    tensor_a: &T,
+    tensor_b: &T,
+    batch: &T::Index,
+    context: &ExecutionContext,
+) -> Result<T>
+where
+    T: TensorLike,
+{
+    let pair = crate::treetn::contract_or_outer_product(tensor_a, tensor_b).map_err(|error| {
+        anyhow::anyhow!("contract_src: site-free local pair merge failed: {error}")
+    })?;
+    let ones = T::ones_in(context, std::slice::from_ref(batch)).map_err(|error| {
+        anyhow::anyhow!("contract_src: site-free batch construction failed: {error}")
+    })?;
+    pair.outer_product(&ones)
+        .map_err(|error| anyhow::anyhow!("contract_src: site-free batch broadcast failed: {error}"))
+}
+
 fn directed_messages_batched_from_factors<T, V>(
     tn: &TreeTN<T, V>,
     edges: &[(V, V)],
     local: &HashMap<V, (&T, &T)>,
     probe_batches: &HashMap<V, Vec<T>>,
     batch: &T::Index,
+    context: &ExecutionContext,
 ) -> Result<HashMap<(V, V), T>>
 where
     T: TensorLike,
@@ -711,9 +757,19 @@ where
             .get(child)
             .ok_or_else(|| anyhow::anyhow!("contract_src: child probe batch is missing"))?;
         let mut factors = Vec::with_capacity(2 + probes.len() + 4);
-        factors.push(tensor_a);
-        factors.push(tensor_b);
-        factors.extend(probes.iter());
+        let local_pair;
+        if probes.is_empty() && tn.site_index_network().neighbors(child).count() == 1 {
+            // A leaf without output legs: no probe or incoming message carries
+            // the retained batch axis, so combine its two (small) local
+            // operands and broadcast the batch into the message. An internal
+            // node gets the batch axis from its incoming messages.
+            local_pair = leaf_batched_local_pair(tensor_a, tensor_b, batch, context)?;
+            factors.push(&local_pair);
+        } else {
+            factors.push(tensor_a);
+            factors.push(tensor_b);
+            factors.extend(probes.iter());
+        }
         for neighbor in tn.site_index_network().neighbors(child) {
             if &neighbor == parent {
                 continue;
@@ -742,9 +798,15 @@ where
             .get(parent)
             .ok_or_else(|| anyhow::anyhow!("contract_src: parent probe batch is missing"))?;
         let mut factors = Vec::with_capacity(2 + probes.len() + 4);
-        factors.push(tensor_a);
-        factors.push(tensor_b);
-        factors.extend(probes.iter());
+        let local_pair;
+        if probes.is_empty() && tn.site_index_network().neighbors(parent).count() == 1 {
+            local_pair = leaf_batched_local_pair(tensor_a, tensor_b, batch, context)?;
+            factors.push(&local_pair);
+        } else {
+            factors.push(tensor_a);
+            factors.push(tensor_b);
+            factors.extend(probes.iter());
+        }
         for neighbor in tn.site_index_network().neighbors(parent) {
             if &neighbor == child {
                 continue;

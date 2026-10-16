@@ -300,9 +300,15 @@ fn factorized_directed_messages_match_prepaired_reference() {
             )
         })
         .collect::<std::collections::HashMap<_, _>>();
-    let actual =
-        directed_messages_batched_from_factors(&tn_a, &edges, &local, &probe_batches, &batch)
-            .unwrap();
+    let actual = directed_messages_batched_from_factors(
+        &tn_a,
+        &edges,
+        &local,
+        &probe_batches,
+        &batch,
+        &context,
+    )
+    .unwrap();
 
     assert_eq!(actual.len(), reference.len());
     for (edge, expected) in reference {

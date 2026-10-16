@@ -252,7 +252,7 @@ where
     let (a_probes, b_probes) = partition_probes(tensor_a, tensor_b, outputs, &probe_tensors)?;
     let probed_a = contract_operand_with_probes(tensor_a, &a_probes, None)?;
     let probed_b = contract_operand_with_probes(tensor_b, &b_probes, None)?;
-    T::contract(&[&probed_a, &probed_b]).map_err(|error| {
+    crate::treetn::contract_or_outer_product(&probed_a, &probed_b).map_err(|error| {
         anyhow::anyhow!("contract_src: factorized probe contraction failed: {error}")
     })
 }
@@ -281,9 +281,10 @@ where
         );
     }
     if outputs.is_empty() {
-        let local = T::contract(&[tensor_a, tensor_b]).map_err(|error| {
-            anyhow::anyhow!("contract_src: scalar local pair contraction failed: {error}")
-        })?;
+        let local =
+            crate::treetn::contract_or_outer_product(tensor_a, tensor_b).map_err(|error| {
+                anyhow::anyhow!("contract_src: scalar local pair contraction failed: {error}")
+            })?;
         let batch_values = T::ones_in(context, std::slice::from_ref(batch)).map_err(|error| {
             anyhow::anyhow!("contract_src: scalar probe batch construction failed: {error}")
         })?;
@@ -464,10 +465,22 @@ where
 }
 
 /// Contract two local operands with additional tensor-network factors.
+///
+/// With no additional factor the pair itself may be an intentional
+/// disconnected product: a site-free node's two local operands carry only
+/// distinct bond indices and share nothing, so the explicit outer product of
+/// [`contract_or_outer_product`](crate::treetn::contract_or_outer_product) is
+/// used. When environment factors are supplied they connect the operands, so
+/// the n-ary contraction order is kept unchanged.
 pub(super) fn contract_site_pair<T>(tensor_a: &T, tensor_b: &T, extra: &[&T]) -> Result<T>
 where
     T: TensorLike,
 {
+    if extra.is_empty() {
+        return crate::treetn::contract_or_outer_product(tensor_a, tensor_b).map_err(|error| {
+            anyhow::anyhow!("contract_src: local pair contraction failed: {error}")
+        });
+    }
     let mut factors = Vec::with_capacity(2 + extra.len());
     factors.push(tensor_a);
     factors.push(tensor_b);
