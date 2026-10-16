@@ -141,8 +141,6 @@ fn phase_rotation_mpo(r: usize, theta: f64) -> Result<SimpleTensorTrain<Complex6
         return Err(anyhow::anyhow!("theta must be finite, got {theta}"));
     }
 
-    // Normalize theta to [0, 2π)
-    let theta_mod = theta.rem_euclid(2.0 * PI);
     let mut tensors = try_vec_with_capacity::<tensor4all_simplett::Tensor3<Complex64>>(
         "phase rotation MPO site list",
         r,
@@ -152,7 +150,10 @@ fn phase_rotation_mpo(r: usize, theta: f64) -> Result<SimpleTensorTrain<Complex6
         // Phase for this site: θ * 2^(R-1-n) (big-endian: site 0 = MSB)
         // This matches Julia's convention: site n=1 (Julia) has power R-n
         let power = (r - 1 - n) as f64;
-        let site_phase = (theta_mod * 2.0_f64.powf(power)).rem_euclid(2.0 * PI);
+        // Multiply first, then reduce once: `theta * 2^power` is exact, while
+        // reducing `theta` first would amplify its rounding error by 2^power
+        // for negative angles (#961).
+        let site_phase = (theta * 2.0_f64.powf(power)).rem_euclid(2.0 * PI);
 
         // Diagonal MPO tensor: out_bit == in_bit
         // Shape: (1, 4, 1) where 4 = 2*2 for (out, in)

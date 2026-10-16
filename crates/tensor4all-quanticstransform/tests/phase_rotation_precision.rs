@@ -1,18 +1,13 @@
-//! Reproduction: `phase_rotation_operator` loses precision for a negative `theta`.
+//! Regression (#961): `phase_rotation_operator` must be accurate for both signs of `theta`.
 //!
-//! `phase_rotation_mpo` first maps `theta` into `[0, 2 pi)` and then multiplies it by
-//! `2^(R-1-n)` (`src/phase_rotation.rs`, "Normalize theta to [0, 2 pi)"). For a negative `theta`
-//! the first step computes `2 pi - |theta|`, whose rounding error (about 1e-15, independent of
-//! `|theta|`) is then amplified by `2^(R-1)` at the most significant site. For
-//! `theta = -2 pi / 2^R` the exact site phases are `-2 pi / 2^(n+1)`, i.e. `-pi, -pi/2, ...`,
-//! which are representable to f64 roundoff without the first step.
+//! `phase_rotation_mpo` used to map `theta` into `[0, 2 pi)` before multiplying it by
+//! `2^(R-1-n)`. For a negative `theta` that first step computes `2 pi - |theta|`, whose rounding
+//! error (about 1e-15, independent of `|theta|`) was then amplified by `2^(R-1)` at the most
+//! significant site. For `theta = -2 pi / 2^R` the exact site phases are `-2 pi / 2^(n+1)`, i.e.
+//! `-pi, -pi/2, ...`, which are representable to f64 roundoff.
 //!
 //! The tests compare the diagonal entries `<x| P_theta |x> = exp(i theta x)` of the operator
-//! with the exact phase at a few `x`. They are `#[ignore]`d so CI stays green until a fix lands:
-//!
-//! ```text
-//! cargo test --release -p tensor4all-quanticstransform --test repro_phase_rotation_negative_theta -- --ignored --nocapture
-//! ```
+//! with the exact phase at a few `x`.
 
 use std::f64::consts::PI;
 
@@ -62,10 +57,9 @@ fn phase_rotation_positive_theta_is_exact() {
     }
 }
 
-/// The same angle with the opposite sign: the error grows like `2^r` (about 1e-14 at r = 8,
-/// 1e-10 at r = 20, 1e-7 at r = 30), although `exp(-i theta x) = conj(exp(i theta x))`.
+/// The same angle with the opposite sign. Before #961 the error grew like `2^r` (about 1e-14 at
+/// r = 8, 1e-10 at r = 20, 1e-7 at r = 30), although `exp(-i theta x) = conj(exp(i theta x))`.
 #[test]
-#[ignore = "reproduces the precision loss of phase_rotation_operator for a negative theta"]
 fn phase_rotation_negative_theta_is_exact() {
     let errors: Vec<(usize, f64)> = [8, 20, 30].map(|r| (r, max_error(r, -1))).to_vec();
     for &(r, err) in &errors {
