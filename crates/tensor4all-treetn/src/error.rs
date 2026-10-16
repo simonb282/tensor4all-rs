@@ -152,10 +152,37 @@ pub enum LinearOperatorTaggedApplyError {
     /// The operator does not have matching input and output mapping counts.
     #[error("operator has {input_count} input mappings but {output_count} output mappings")]
     MappingCountMismatch {
-        /// Number of true input mappings found in operator node order.
+        /// Total number of true input mappings across all operator nodes.
         input_count: usize,
-        /// Number of true output mappings found in operator node order.
+        /// Total number of true output mappings across all operator nodes.
         output_count: usize,
+    },
+    /// A selected state index lives on a node that has no operator mapping.
+    #[error(
+        "state index tagged {tag} on state node {node} has no operator {role} mapping; \
+         operator node names must match the state node names"
+    )]
+    MissingNodeMapping {
+        /// Mapping side that is missing: `"input"` or `"output"`.
+        role: &'static str,
+        /// Numbered tag that selected the state index, such as `"k=3"`.
+        tag: String,
+        /// Debug representation of the state node holding the selected index.
+        node: String,
+    },
+    /// A node's selected-tag count differs from that node's mapping count.
+    #[error(
+        "state node {node} has {selected} selected tag(s) but {mappings} operator {role} mapping(s)"
+    )]
+    SelectedTagCountMismatch {
+        /// Mapping side that mismatches: `"input"` or `"output"`.
+        role: &'static str,
+        /// Debug representation of the state/operator node.
+        node: String,
+        /// Number of selected state tags on the node.
+        selected: usize,
+        /// Number of operator mappings declared for the node.
+        mappings: usize,
     },
     /// Explicit binding or application failed after tag selection.
     #[error("failed to apply operator to tagged indices: {0}")]
