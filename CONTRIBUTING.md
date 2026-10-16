@@ -35,10 +35,11 @@ budget instead of per-test or per-job caps:
 Do not raise either number to accommodate a slow test. A test that needs more is a
 heavy test:
 
-- keep it in `crates/*/tests/heavy_*.rs` and mark it
+- keep it in `crates/*/tests/heavy_*.rs`, declared as a module in that package's
+  `tests/main.rs` integration target, and mark it
   `#[ignore = "heavy: runs in the scheduled heavy-tests workflow (see CONTRIBUTING.md)"]`;
 - [`.github/workflows/heavy-tests.yml`](.github/workflows/heavy-tests.yml) runs those
-  files nightly (`-E 'binary(/^heavy_/)' --run-ignored ignored-only`), builds every
+  files nightly (`-E 'test(/^heavy_/)' --run-ignored ignored-only`), builds every
   target for the compile check, and opens or updates a `ci-nightly` issue when it fails.
 
 Run the heavy suite locally with:
@@ -46,7 +47,7 @@ Run the heavy suite locally with:
 ```bash
 cargo build --locked --profile ci --workspace --all-targets
 cargo nextest run --locked --cargo-profile ci -p tensor4all-treeaci \
-    --run-ignored ignored-only -E 'binary(/^heavy_/)'
+    --run-ignored ignored-only -E 'test(/^heavy_/)'
 ```
 
 Example and bench targets stay out of the default suite for the same reason: they add
@@ -100,7 +101,9 @@ publication approvals are not weakened by choosing focused local checks.
 ### Full validation reference (not an unconditional local gate)
 
 Hosted CI remains required and authoritative for comprehensive tests, coverage,
-documentation and feature/backend checks. Consult `.github/workflows/CI_rs.yml`
+documentation and feature/backend checks. Coverage and its per-file thresholds
+run nightly in `.github/workflows/coverage.yml`, not on pull requests; a failing
+night files a `ci-nightly` issue. Consult `.github/workflows/CI_rs.yml`
 for the current commands and platform setup. The following commands are useful
 when broader local validation is needed, not as a checklist for every push.
 They require `cargo-nextest`, mdBook 0.5.2, the HDF5 development library, and
