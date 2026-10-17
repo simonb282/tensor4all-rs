@@ -44,8 +44,9 @@ fn validate_ortho_limits(llim: i32, rlim: i32, length: usize) -> Result<()> {
 
 const CANONICAL_FORM_ATTR: &str = "canonical_form";
 
-fn write_canonical_form(group: &Group, tt: &TensorTrain) -> Result<()> {
-    if let Some(form) = tt.canonical_form() {
+/// Write the optional `canonical_form` Int32 attribute (absent for `None`).
+pub(crate) fn write_canonical_form(group: &Group, form: Option<CanonicalForm>) -> Result<()> {
+    if let Some(form) = form {
         let canonical_form_attr = group
             .new_attr::<i32>()
             .shape(())
@@ -58,7 +59,8 @@ fn write_canonical_form(group: &Group, tt: &TensorTrain) -> Result<()> {
     Ok(())
 }
 
-fn read_canonical_form(group: &Group) -> Result<Option<CanonicalForm>> {
+/// Read the optional `canonical_form` Int32 attribute (`None` when absent).
+pub(crate) fn read_canonical_form(group: &Group) -> Result<Option<CanonicalForm>> {
     if !backend::attribute_exists(group, CANONICAL_FORM_ATTR)
         .context("Failed to check MPS canonical_form attribute existence")?
     {
@@ -115,7 +117,7 @@ pub(crate) fn write_mps(group: &Group, tt: &TensorTrain) -> Result<()> {
     let rlim_ds = group.new_dataset::<i64>().shape(()).create("rlim")?;
     rlim_ds.as_writer().write_scalar(&(tt.rlim() as i64))?;
 
-    write_canonical_form(group, tt)?;
+    write_canonical_form(group, tt.canonical_form())?;
 
     // Write each tensor (1-indexed, Julia convention)
     let tensors = tt.tensors();
