@@ -1,5 +1,7 @@
 use super::*;
 
+use std::collections::HashMap;
+
 fn basis_vector(dim: usize, selected: usize) -> Vec<f64> {
     let mut values = vec![0.0; dim];
     values[selected] = 1.0;
@@ -246,4 +248,73 @@ fn move_center_to_region_full_rank_handles_errors_and_path_moves() {
 
     move_center_to_region_full_rank(&mut state, &["site1"]).unwrap();
     assert!(state.canonical_region().contains(&"site1"));
+}
+
+#[test]
+fn gse_tdvp_options_default_matches_component_defaults() {
+    let options = GseTdvpOptions::<usize>::default();
+    let gse = GseOptions::<usize>::default();
+    let tdvp = TdvpOptions::default();
+
+    assert_eq!(options.gse.krylov_dim, gse.krylov_dim);
+    assert_eq!(options.gse.density_weight_cutoff, gse.density_weight_cutoff);
+    assert_eq!(options.gse.hermitian_tol, gse.hermitian_tol);
+    assert_eq!(options.gse.normalize_references, gse.normalize_references);
+    assert_eq!(options.tdvp.nsweeps, tdvp.nsweeps);
+    assert_eq!(options.tdvp.max_bond_dim, tdvp.max_bond_dim);
+}
+
+#[test]
+fn validate_options_rejects_zero_reference_max_bond_dim() {
+    let options = GseOptions::<usize>::default().with_reference_max_bond_dim(0);
+    let err = validate_options(&options).unwrap_err();
+
+    assert!(matches!(
+        err,
+        GseError::InvalidOption { option, reason }
+            if option == "reference_max_bond_dim" && reason.contains("greater than zero")
+    ));
+}
+
+/// A GSE operator that is never contracted: `build_references` fails while
+/// validating the requested contraction center, before the MPO is touched.
+fn empty_operator() -> LinearOperator<IdxTensor, &'static str> {
+    LinearOperator::new(TreeTN::new(), HashMap::new(), HashMap::new())
+}
+
+#[test]
+fn build_references_reports_operator_application_failure() {
+    let init = product_chain_state(2, 2);
+    let options = GseOptions::<&'static str> {
+        krylov_dim: 1,
+        reference_apply: ApplyOptions {
+            center: Some("missing"),
+            ..ApplyOptions::zipup()
+        },
+        ..GseOptions::<&'static str>::default()
+    };
+
+    let err = build_references(&empty_operator(), &init, &"site0", &options).unwrap_err();
+
+    assert!(matches!(
+        err,
+        GseError::Algorithm { context, .. }
+            if context == "GSE failed to apply operator while building references"
+    ));
+}
+
+#[test]
+fn move_center_to_region_full_rank_sweeps_along_the_path() {
+    let mut state = product_chain3_state(2)
+        .canonicalize(["site0"], CanonicalizationOptions::forced())
+        .unwrap();
+    let dense_before = state.to_dense().unwrap();
+
+    move_center_to_region_full_rank(&mut state, &["site2"]).unwrap();
+
+    assert!(state.canonical_region().contains(&"site2"));
+    assert!(state.is_canonicalized());
+    state.verify_internal_consistency().unwrap();
+    let dense_after = state.to_dense().unwrap();
+    assert!(dense_before.distance(&dense_after).unwrap() < 1.0e-12);
 }
