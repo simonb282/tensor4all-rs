@@ -1003,3 +1003,54 @@ fn build_binary_einsum_ids_rejects_duplicate_axis() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("duplicate"));
 }
+
+#[test]
+fn concrete_einsum_plan_cache_keeps_issue_891_working_set_resident() {
+    reset_concrete_einsum_plan_cache();
+    // 400 distinct A[i,j] B[j,k] C[k,l] complex shapes: the churn cycle from
+    // issue #891, which the old 256-entry clear-on-full bound re-prepared on
+    // every call. Two passes must keep all 400 plans resident.
+    const SIGNATURES: usize = 400;
+    let tensors = (0..SIGNATURES)
+        .map(|k| {
+            let shape = [
+                2 + k % 7,
+                2 + (k / 7) % 7,
+                2 + (k / 49) % 7,
+                2 + (k / 343) % 7,
+            ];
+            [
+                complex_test_tensor(&[shape[0], shape[1]], 0),
+                complex_test_tensor(&[shape[1], shape[2]], 1),
+                complex_test_tensor(&[shape[2], shape[3]], 2),
+            ]
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..2 {
+        for t in &tensors {
+            let reads = [
+                NativeTensorReadInput::Borrowed(TensorRead::from_tensor(&t[0])),
+                NativeTensorReadInput::Borrowed(TensorRead::from_tensor(&t[1])),
+                NativeTensorReadInput::Borrowed(TensorRead::from_tensor(&t[2])),
+            ];
+            einsum_native_tensor_reads(
+                &[
+                    (&reads[0], &[0, 1]),
+                    (&reads[1], &[1, 2]),
+                    (&reads[2], &[2, 3]),
+                ],
+                &[0, 3],
+            )
+            .expect("working-set contraction should succeed");
+        }
+    }
+    assert_eq!(concrete_einsum_plan_cache_len(), SIGNATURES);
+}
+
+fn complex_test_tensor(shape: &[usize], seed: usize) -> NativeTensor {
+    let len: usize = shape.iter().product();
+    let values = (0..len)
+        .map(|index| Complex64::new(((index + seed) % 13) as f64 * 0.1, 0.0))
+        .collect::<Vec<_>>();
+    NativeTensor::from_vec_col_major(shape.to_vec(), values).expect("valid complex test tensor")
+}

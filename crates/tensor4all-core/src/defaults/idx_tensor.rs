@@ -21,7 +21,7 @@ use tenferro_ad::{extension::adopt_untracked_eager_value, EagerRuntime, EagerTen
 use tenferro_einsum::{EagerSessionEinsumExt, EinsumSubscripts};
 use tenferro_linalg::{EagerSessionLinalgExt, RankRevealingQrOptions};
 use tensor4all_tensorbackend::{
-    contract_native_tensor, default_eager_ctx, dense_native_tensor_from_col_major,
+    default_eager_ctx, dense_native_tensor_from_col_major,
     dense_native_tensor_from_col_major_owned, diag_native_tensor_from_col_major,
     native_tensor_primal_to_diag, storage_payload_native_read_input, storage_to_native_tensor,
     ExecutionContext, NativeTensorReadInput, TensorElement,
@@ -1962,10 +1962,36 @@ impl IdxTensor {
             .all(|dtype| matches!(dtype, DType::F32 | DType::F64 | DType::C32 | DType::C64)))
         {
             return Err(anyhow::anyhow!(
-                "structured contraction supports only f32, f64, c32, and c64 operands"
+                "eager operations support only f32, f64, c32, and c64 operands"
             ));
         };
         Ok(target)
+    }
+
+    /// Promote two materialized eager operands to their common dtype inside the
+    /// owner runtime.
+    ///
+    /// Mixed-dtype eager operations must not duplicate their operands into
+    /// context-free native tensors: that drops the caller's execution context
+    /// and any AD metadata. Casting the narrower operand through its own
+    /// runtime's session is the same mechanism the same-dtype paths use, so the
+    /// context and the graph survive. At most one operand is cast; the other is
+    /// returned unchanged.
+    fn promote_eager_operands(
+        lhs: &EagerTensor,
+        rhs: &EagerTensor,
+    ) -> Result<(EagerTensor, EagerTensor)> {
+        let target = Self::common_eager_dtype(&[lhs.dtype(), rhs.dtype()])?;
+        let cast = |eager: &EagerTensor| -> Result<EagerTensor> {
+            if eager.dtype() == target {
+                Ok(eager.clone())
+            } else {
+                Ok(eager
+                    .runtime()
+                    .with_eager_session(|session| session.cast(eager, target))?)
+            }
+        };
+        Ok((cast(lhs)?, cast(rhs)?))
     }
 
     fn should_use_structured_payload_contract(&self, other: &Self) -> bool {
@@ -2195,9 +2221,10 @@ impl IdxTensor {
 
         let output_len = checked_product(&output_payload_dims)?;
         let mut output_payload = Vec::with_capacity(output_len);
+        let mut output_payload_index = Vec::with_capacity(output_payload_dims.len());
+        let mut input_payload_index = vec![0usize; payload_rank];
         for linear in 0..output_len {
-            let output_payload_index = decode_col_major_linear(linear, &output_payload_dims)?;
-            let mut input_payload_index = vec![0usize; payload_rank];
+            decode_col_major_linear_into(linear, &output_payload_dims, &mut output_payload_index);
             for class_id in 0..payload_rank {
                 input_payload_index[class_id] =
                     if let Some(position) = selected_class_positions[class_id] {
@@ -2238,10 +2265,13 @@ impl IdxTensor {
         let axis_classes = self.storage.axis_classes();
         let output_len = checked_product(&kept_dims)?;
         let mut output = Vec::with_capacity(output_len);
+        let mut kept_position = Vec::with_capacity(kept_dims.len());
+        let mut input_payload_index = vec![None; payload_dims.len()];
+        let mut dense_positions = Vec::with_capacity(payload_dims.len());
 
         for linear in 0..output_len {
-            let kept_position = decode_col_major_linear(linear, &kept_dims)?;
-            let mut input_payload_index = selected_class_positions.to_vec();
+            decode_col_major_linear_into(linear, &kept_dims, &mut kept_position);
+            input_payload_index.copy_from_slice(selected_class_positions);
             let mut is_structural_zero = false;
 
             for (&axis, &position) in kept_axes.iter().zip(kept_position.iter()) {
@@ -2261,18 +2291,18 @@ impl IdxTensor {
                 continue;
             }
 
-            let input_payload_index = input_payload_index
-                .into_iter()
-                .enumerate()
-                .map(|(class_id, position)| {
-                    position.ok_or_else(|| {
-                        anyhow::anyhow!(
+            dense_positions.clear();
+            for (class_id, position) in input_payload_index.iter().enumerate() {
+                match position {
+                    Some(position) => dense_positions.push(*position),
+                    None => {
+                        return Err(anyhow::anyhow!(
                             "structured payload class {class_id} is neither selected nor kept"
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let input_linear = encode_col_major_linear(&input_payload_index, payload_dims)?;
+                        ))
+                    }
+                }
+            }
+            let input_linear = encode_col_major_linear(&dense_positions, payload_dims)?;
             output.push(payload[input_linear]);
         }
 
@@ -3834,7 +3864,7 @@ impl IdxTensor {
             return profile_pairwise_contract_section("structured_payload_contract", || {
                 self.contract_structured_payloads(
                     other,
-                    spec.result_indices.into_vec(),
+                    spec.result_indices,
                     &spec.axes_a,
                     &spec.axes_b,
                 )
@@ -3864,50 +3894,47 @@ impl IdxTensor {
                 )
             })?;
             return profile_pairwise_contract_section("from_inner", || {
-                Self::from_inner(spec.result_indices.into_vec(), result)
+                Self::from_inner(spec.result_indices, result)
             });
         }
 
-        let self_dtype = self.try_materialized_inner()?.dtype();
-        let other_dtype = other.try_materialized_inner()?.dtype();
-        if self_dtype != other_dtype {
-            if options.has_conj() {
-                let lhs = if options.lhs_conj {
-                    self.conj()
-                } else {
-                    self.clone()
-                };
-                let rhs = if options.rhs_conj {
-                    other.conj()
-                } else {
-                    other.clone()
-                };
-                return lhs.try_contract_pairwise_default(&rhs);
-            }
-            let self_native = self.try_materialized_inner()?.duplicate_value()?;
-            let other_native = other.try_materialized_inner()?.duplicate_value()?;
-            let result_native = profile_pairwise_contract_section("native_contract", || {
-                contract_native_tensor(&self_native, &spec.axes_a, &other_native, &spec.axes_b)
-            })?;
-            return profile_pairwise_contract_section("from_native", || {
-                Self::from_untracked_native_with_axis_classes(
-                    spec.result_indices.into_vec(),
-                    result_native,
-                    result_axis_classes,
-                )
-            });
+        let self_inner = self.try_materialized_inner()?;
+        let other_inner = other.try_materialized_inner()?;
+        let self_dtype = self_inner.dtype();
+        let other_dtype = other_inner.dtype();
+        if self_dtype != other_dtype && options.has_conj() {
+            let lhs = if options.lhs_conj {
+                self.conj()
+            } else {
+                self.clone()
+            };
+            let rhs = if options.rhs_conj {
+                other.conj()
+            } else {
+                other.clone()
+            };
+            return lhs.try_contract_pairwise_default(&rhs);
         }
+        // Mixed dtypes are promoted inside the operands' own runtimes so the
+        // caller's execution context and AD metadata survive; the promoted
+        // pair then runs the same eager dot_general as the same-dtype path.
+        let promoted_lhs;
+        let promoted_rhs;
+        let (lhs, rhs): (&EagerTensor, &EagerTensor) = if self_dtype != other_dtype {
+            let (lhs, rhs) = profile_pairwise_contract_section("promote_mixed_dtype", || {
+                Self::promote_eager_operands(self_inner, other_inner)
+            })?;
+            promoted_lhs = lhs;
+            promoted_rhs = rhs;
+            (&promoted_lhs, &promoted_rhs)
+        } else {
+            (self_inner, other_inner)
+        };
 
         let config = profile_pairwise_contract_section("build_dot_general_config", || {
             Self::binary_dot_general_config(&spec.axes_a, &spec.axes_b)
         })?;
         let result = profile_pairwise_contract_section("dot_general_with_conj", || {
-            let lhs = profile_pairwise_contract_section("lhs_try_materialized_inner", || {
-                self.try_materialized_inner()
-            })?;
-            let rhs = profile_pairwise_contract_section("rhs_try_materialized_inner", || {
-                other.try_materialized_inner()
-            })?;
             profile_pairwise_contract_section("dot_general_execute", || {
                 lhs.runtime().with_eager_session(|session| {
                     session.dot_general_with_conj(
@@ -3926,11 +3953,7 @@ impl IdxTensor {
             tensor_profile_bytes(result.dtype(), result.shape())?,
         );
         profile_pairwise_contract_section("from_inner_axis_classes", || {
-            Self::from_inner_with_axis_classes(
-                spec.result_indices.into_vec(),
-                result,
-                result_axis_classes,
-            )
+            Self::from_inner_with_axis_classes(spec.result_indices, result, result_axis_classes)
         })
     }
 
@@ -4133,7 +4156,7 @@ impl IdxTensor {
         if self.should_use_structured_payload_contract(other) {
             return self.contract_structured_payloads(
                 other,
-                spec.result_indices.into_vec(),
+                spec.result_indices,
                 &spec.axes_a,
                 &spec.axes_b,
             );
@@ -4146,22 +4169,26 @@ impl IdxTensor {
                 .runtime()
                 .with_eager_session(|session| session.mul(lhs, rhs))
                 .map_err(|e| anyhow::anyhow!("tensordot scalar multiply failed: {e}"))?;
-            return Self::from_inner(spec.result_indices.into_vec(), result);
+            return Self::from_inner(spec.result_indices, result);
         }
 
-        let self_dtype = self.try_materialized_inner()?.dtype();
-        let other_dtype = other.try_materialized_inner()?.dtype();
-        if self_dtype != other_dtype {
-            let self_native = self.try_materialized_inner()?.duplicate_value()?;
-            let other_native = other.try_materialized_inner()?.duplicate_value()?;
-            let result_native =
-                contract_native_tensor(&self_native, &spec.axes_a, &other_native, &spec.axes_b)?;
-            return Self::from_untracked_native_with_axis_classes(
-                spec.result_indices.into_vec(),
-                result_native,
-                result_axis_classes,
-            );
-        }
+        let self_inner = self.try_materialized_inner()?;
+        let other_inner = other.try_materialized_inner()?;
+        let self_dtype = self_inner.dtype();
+        let other_dtype = other_inner.dtype();
+        // Mixed dtypes are promoted inside the operands' own runtimes so the
+        // caller's execution context and AD metadata survive; the promoted
+        // pair then runs the same eager einsum as the same-dtype path.
+        let promoted_lhs;
+        let promoted_rhs;
+        let (lhs, rhs): (&EagerTensor, &EagerTensor) = if self_dtype != other_dtype {
+            let (lhs, rhs) = Self::promote_eager_operands(self_inner, other_inner)?;
+            promoted_lhs = lhs;
+            promoted_rhs = rhs;
+            (&promoted_lhs, &promoted_rhs)
+        } else {
+            (self_inner, other_inner)
+        };
 
         let subscripts = Self::build_binary_einsum_subscripts(
             self.indices.len(),
@@ -4169,17 +4196,11 @@ impl IdxTensor {
             other.indices.len(),
             &spec.axes_b,
         )?;
-        let lhs = self.try_materialized_inner()?;
-        let rhs = other.try_materialized_inner()?;
         let result = lhs
             .runtime()
             .with_eager_session(|session| session.einsum_subscripts(&[lhs, rhs], &subscripts))
             .map_err(|e| anyhow::anyhow!("tensordot failed: {e}"))?;
-        Self::from_inner_with_axis_classes(
-            spec.result_indices.into_vec(),
-            result,
-            result_axis_classes,
-        )
+        Self::from_inner_with_axis_classes(spec.result_indices, result, result_axis_classes)
     }
 
     pub(crate) fn try_outer_product_pairwise(&self, other: &Self) -> Result<Self> {
@@ -4213,18 +4234,23 @@ impl IdxTensor {
         if self.should_use_structured_payload_contract(other) {
             return self.contract_structured_payloads(other, result_indices, &[], &[]);
         }
-        let self_dtype = self.try_materialized_inner()?.dtype();
-        let other_dtype = other.try_materialized_inner()?.dtype();
-        if self_dtype != other_dtype {
-            let self_native = self.try_materialized_inner()?.duplicate_value()?;
-            let other_native = other.try_materialized_inner()?.duplicate_value()?;
-            let result_native = contract_native_tensor(&self_native, &[], &other_native, &[])?;
-            return Self::from_untracked_native_with_axis_classes(
-                result_indices,
-                result_native,
-                result_axis_classes,
-            );
-        }
+        let self_inner = self.try_materialized_inner()?;
+        let other_inner = other.try_materialized_inner()?;
+        let self_dtype = self_inner.dtype();
+        let other_dtype = other_inner.dtype();
+        // Mixed dtypes are promoted inside the operands' own runtimes so the
+        // caller's execution context and AD metadata survive; the promoted
+        // pair then runs the same eager einsum as the same-dtype path.
+        let promoted_lhs;
+        let promoted_rhs;
+        let (lhs, rhs): (&EagerTensor, &EagerTensor) = if self_dtype != other_dtype {
+            let (lhs, rhs) = Self::promote_eager_operands(self_inner, other_inner)?;
+            promoted_lhs = lhs;
+            promoted_rhs = rhs;
+            (&promoted_lhs, &promoted_rhs)
+        } else {
+            (self_inner, other_inner)
+        };
 
         let subscripts = Self::build_binary_einsum_subscripts(
             self.indices.len(),
@@ -4232,8 +4258,6 @@ impl IdxTensor {
             other.indices.len(),
             &[],
         )?;
-        let lhs = self.try_materialized_inner()?;
-        let rhs = other.try_materialized_inner()?;
         let result = lhs
             .runtime()
             .with_eager_session(|session| session.einsum_subscripts(&[lhs, rhs], &subscripts))
@@ -8432,22 +8456,21 @@ fn map_payload_support_coordinate(
     target_seen.iter().all(|&seen| seen)
 }
 
-fn decode_col_major_linear(linear: usize, dims: &[usize]) -> Result<Vec<usize>> {
-    let total = checked_product(dims)?;
-    if !(linear < total) {
-        return Err(anyhow::anyhow!(
-            "linear offset {} out of bounds for dims {:?}",
-            linear,
-            dims
-        ));
-    };
+/// Write the column-major multi-index of `linear` into `out`, reusing the
+/// caller's buffer.
+///
+/// Unlike a checked decoder, this skips re-deriving `product(dims)`: the two
+/// structured-selection loops already computed `linear < product(dims)` from
+/// the same `dims`, which also makes every `dim` non-zero, so the `% dim`
+/// below cannot divide by zero. Hoisting the buffer and the bound derivation
+/// out of these tensor-sized loops removes the per-element allocation.
+fn decode_col_major_linear_into(linear: usize, dims: &[usize], out: &mut Vec<usize>) {
+    out.clear();
     let mut remaining = linear;
-    let mut out = Vec::with_capacity(dims.len());
     for &dim in dims {
         out.push(remaining % dim);
         remaining /= dim;
     }
-    Ok(out)
 }
 
 fn encode_col_major_linear(indices: &[usize], dims: &[usize]) -> Result<usize> {

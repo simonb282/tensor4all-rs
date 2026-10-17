@@ -137,7 +137,11 @@ struct NativeEinsumProfileEntry {
     total_time: Duration,
 }
 
-const CONCRETE_EINSUM_PLAN_CACHE_CAPACITY: usize = 256;
+/// Entries kept before the cache is cleared. Real workloads cycle through
+/// hundreds to a few thousand distinct contraction signatures (#891: a
+/// 400-shape QTT cycle re-prepared every plan at 256), so the bound sits above
+/// that working set while still capping the per-thread cache.
+const CONCRETE_EINSUM_PLAN_CACHE_CAPACITY: usize = 4096;
 
 thread_local! {
     static NATIVE_EINSUM_PROFILE_STATE: RefCell<HashMap<NativeEinsumSignature, NativeEinsumProfileEntry>> =
