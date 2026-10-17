@@ -1536,6 +1536,39 @@ where
         self.canonical_form
     }
 
+    /// Set the canonical form without touching any tensor.
+    ///
+    /// Intended for restoring state from a trusted source such as a
+    /// serialized file, together with [`Self::set_canonical_region`]: once
+    /// the region and form match a later [`Self::canonicalize`] request, that
+    /// call returns early and leaves the tensors unchanged. The tensors are
+    /// not verified to actually be in the given form.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tensor4all_core::{DynIndex, IdxTensor};
+    /// use tensor4all_treetn::{CanonicalForm, TreeTN};
+    ///
+    /// let (s0, s1, b) = (DynIndex::new_dyn(2), DynIndex::new_dyn(2), DynIndex::new_dyn(2));
+    /// let mut tn = TreeTN::<IdxTensor, String>::from_tensors(
+    ///     vec![
+    ///         IdxTensor::from_dense(vec![s0, b.clone()], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+    ///         IdxTensor::from_dense(vec![b, s1], vec![5.0, 6.0, 7.0, 8.0]).unwrap(),
+    ///     ],
+    ///     vec!["a".to_string(), "b".to_string()],
+    /// )
+    /// .unwrap();
+    /// assert_eq!(tn.canonical_form(), None);
+    /// tn.set_canonical_form(Some(CanonicalForm::LU));
+    /// assert_eq!(tn.canonical_form(), Some(CanonicalForm::LU));
+    /// tn.set_canonical_form(None);
+    /// assert_eq!(tn.canonical_form(), None);
+    /// ```
+    pub fn set_canonical_form(&mut self, form: Option<CanonicalForm>) {
+        self.canonical_form = form;
+    }
+
     /// Add a node to the orthogonalization region.
     ///
     /// Validates that the node exists in the graph.

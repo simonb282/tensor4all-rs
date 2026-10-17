@@ -1001,6 +1001,176 @@ fn test_treetn_roundtrip() {
     }
 }
 
+/// 4-node star (centre `c`, three leaves, bond dimension 3) with
+/// deterministic non-trivial data.
+fn make_star_treetn() -> TreeTN<IdxTensor, String> {
+    let bonds: Vec<DynIndex> = (0..3).map(|_| DynIndex::new_dyn(3)).collect();
+    let s_c = DynIndex::new_dyn(2);
+    let data = |n: usize| -> Vec<f64> { (0..n).map(|i| ((i * 7 + 3) % 11) as f64 - 5.0).collect() };
+
+    let mut tensors = vec![IdxTensor::from_dense(
+        vec![bonds[0].clone(), bonds[1].clone(), bonds[2].clone(), s_c],
+        data(54),
+    )
+    .unwrap()];
+    let mut names = vec!["c".to_string()];
+    for (i, b) in bonds.iter().enumerate() {
+        tensors.push(
+            IdxTensor::from_dense(
+                vec![b.clone(), DynIndex::new_dyn(2)],
+                data(6 + i)[..6].to_vec(),
+            )
+            .unwrap(),
+        );
+        names.push(format!("leaf{i}"));
+    }
+    TreeTN::from_tensors(tensors, names).unwrap()
+}
+
+fn assert_treetn_bitwise_equal(a: &TreeTN<IdxTensor, String>, b: &TreeTN<IdxTensor, String>) {
+    let (ta, tb) = (treetn_node_tensors(a), treetn_node_tensors(b));
+    assert_eq!(ta.len(), tb.len());
+    for (x, y) in ta.iter().zip(&tb) {
+        assert_eq!(x.indices(), y.indices());
+        assert_eq!(x.distance(y).unwrap(), 0.0);
+    }
+}
+
+#[test]
+fn test_treetn_canonical_roundtrip() {
+    use tensor4all_treetn::CanonicalizationOptions;
+    let path = TempHdf5Path::new("treetn_canonical_roundtrip");
+    let tn = make_star_treetn()
+        .canonicalize(["c".to_string()], CanonicalizationOptions::default())
+        .unwrap();
+    assert_eq!(tn.canonical_form(), Some(CanonicalForm::Unitary));
+
+    save_treetn(path.as_str(), "tn", &tn).unwrap();
+    let loaded = load_treetn::<String>(path.as_str(), "tn").unwrap();
+
+    assert_eq!(loaded.canonical_region(), tn.canonical_region());
+    assert_eq!(loaded.canonical_form(), Some(CanonicalForm::Unitary));
+    assert_treetn_bitwise_equal(&tn, &loaded);
+
+    // Canonicalizing to the saved region must be a no-op on the loaded tree.
+    let again = loaded
+        .canonicalize(["c".to_string()], CanonicalizationOptions::default())
+        .unwrap();
+    assert_treetn_bitwise_equal(&tn, &again);
+}
+
+#[test]
+fn test_treetn_canonical_roundtrip_two_nodes_and_lu() {
+    use tensor4all_treetn::CanonicalizationOptions;
+    let path = TempHdf5Path::new("treetn_canonical_two_nodes");
+    let (s0, s1, b) = (
+        DynIndex::new_dyn(2),
+        DynIndex::new_dyn(2),
+        DynIndex::new_dyn(2),
+    );
+    let tn = TreeTN::<IdxTensor, String>::from_tensors(
+        vec![
+            IdxTensor::from_dense(vec![s0, b.clone()], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            IdxTensor::from_dense(vec![b, s1], vec![5.0, 6.0, 7.0, 8.0]).unwrap(),
+        ],
+        vec!["a".to_string(), "b".to_string()],
+    )
+    .unwrap()
+    .canonicalize(["a".to_string()], CanonicalizationOptions::default())
+    .unwrap();
+    save_treetn(path.as_str(), "tn", &tn).unwrap();
+    let loaded = load_treetn::<String>(path.as_str(), "tn").unwrap();
+    assert_eq!(loaded.canonical_region(), tn.canonical_region());
+    assert_eq!(loaded.canonical_form(), Some(CanonicalForm::Unitary));
+
+    // Non-default form and a two-node region are preserved too.
+    let mut tn = make_test_treetn();
+    tn.set_canonical_region(["left".to_string(), "root".to_string()])
+        .unwrap();
+    tn.set_canonical_form(Some(CanonicalForm::LU));
+    save_treetn(path.as_str(), "tn_lu", &tn).unwrap();
+    let loaded = load_treetn::<String>(path.as_str(), "tn_lu").unwrap();
+    assert_eq!(loaded.canonical_region(), tn.canonical_region());
+    assert_eq!(loaded.canonical_form(), Some(CanonicalForm::LU));
+}
+
+#[test]
+fn test_treetn_without_canonical_attrs() {
+    use tensor4all_treetn::CanonicalizationOptions;
+    // A tree that was never canonicalized writes neither attribute.
+    let path = TempHdf5Path::new("treetn_no_canonical");
+    save_treetn(path.as_str(), "tn", &make_test_treetn()).unwrap();
+    {
+        let file = File::open(path.as_str()).unwrap();
+        let group = file.group("tn").unwrap();
+        assert!(group.attr("canonical_region").is_err());
+        assert!(group.attr("canonical_form").is_err());
+    }
+    let loaded = load_treetn::<String>(path.as_str(), "tn").unwrap();
+    assert!(loaded.canonical_region().is_empty());
+    assert_eq!(loaded.canonical_form(), None);
+
+    // A legacy file (canonical tree, attributes stripped) loads as before.
+    let path = TempHdf5Path::new("treetn_stripped_canonical");
+    let tn = make_star_treetn()
+        .canonicalize(["c".to_string()], CanonicalizationOptions::default())
+        .unwrap();
+    save_treetn(path.as_str(), "tn", &tn).unwrap();
+    {
+        let file = File::open_rw(path.as_str()).unwrap();
+        let group = file.group("tn").unwrap();
+        group.delete_attr("canonical_region").unwrap();
+        group.delete_attr("canonical_form").unwrap();
+    }
+    let loaded = load_treetn::<String>(path.as_str(), "tn").unwrap();
+    assert!(loaded.canonical_region().is_empty());
+    assert_eq!(loaded.canonical_form(), None);
+    assert_treetn_bitwise_equal(&tn, &loaded);
+}
+
+#[test]
+fn test_treetn_invalid_canonical_attrs_rejected() {
+    use tensor4all_treetn::CanonicalizationOptions;
+    let path = TempHdf5Path::new("treetn_invalid_canonical");
+    let tn = make_star_treetn()
+        .canonicalize(["c".to_string()], CanonicalizationOptions::default())
+        .unwrap();
+    save_treetn(path.as_str(), "tn", &tn).unwrap();
+
+    {
+        let file = File::open_rw(path.as_str()).unwrap();
+        let group = file.group("tn").unwrap();
+        group.delete_attr("canonical_form").unwrap();
+        group
+            .new_attr::<i32>()
+            .shape(())
+            .create("canonical_form")
+            .unwrap()
+            .as_writer()
+            .write_scalar(&99)
+            .unwrap();
+    }
+    let err = load_treetn::<String>(path.as_str(), "tn").unwrap_err();
+    assert!(err.to_string().contains("canonical_form"), "{err}");
+
+    {
+        let file = File::open_rw(path.as_str()).unwrap();
+        let group = file.group("tn").unwrap();
+        group.delete_attr("canonical_form").unwrap();
+        group.delete_attr("canonical_region").unwrap();
+        group
+            .new_attr::<VarLenUnicode>()
+            .shape(1)
+            .create("canonical_region")
+            .unwrap()
+            .as_writer()
+            .write(&[VarLenUnicode::from_str("nope").unwrap()])
+            .unwrap();
+    }
+    let err = load_treetn::<String>(path.as_str(), "tn").unwrap_err();
+    assert!(format!("{err:#}").contains("canonical_region"), "{err:#}");
+}
+
 #[test]
 fn test_treetn_append_multiple() {
     let path = TempHdf5Path::new("treetn_append");
