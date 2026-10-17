@@ -67,8 +67,9 @@ where
     /// Create a new Contraction from two MPOs
     /// # Errors
     ///
-    /// Returns an error when the two MPOs differ in length (a shape mismatch)
-    /// or the contraction setup fails.
+    /// Returns [`MPOError::LengthMismatch`] when the MPOs have different
+    /// lengths, or [`MPOError::SharedDimensionMismatch`] when a shared physical
+    /// dimension disagrees.
     ///
     pub fn new(mpo_a: MPO<T>, mpo_b: MPO<T>) -> Result<Self> {
         if mpo_a.len() != mpo_b.len() {
@@ -112,8 +113,8 @@ where
     /// Create a new Contraction with a transformation function
     /// # Errors
     ///
-    /// Returns an error when the two MPOs differ in length (a shape mismatch)
-    /// or the contraction setup fails.
+    /// Returns the same errors as [`Contraction::new`]:
+    /// [`MPOError::LengthMismatch`] or [`MPOError::SharedDimensionMismatch`].
     ///
     pub fn with_transform<F>(mpo_a: MPO<T>, mpo_b: MPO<T>, f: F) -> Result<Self>
     where
@@ -181,8 +182,10 @@ where
     /// - j_k is the index for s2 of MPO B at site k
     /// # Errors
     ///
-    /// Returns an error when the contraction evaluation fails (a shape or index
-    /// mismatch, or a backend failure).
+    /// Returns [`MPOError::InvalidOperation`] when `indices` does not have one
+    /// pair per site, when an environment allocation fails, or when the final
+    /// environment is not `1 x 1`; [`MPOError::Empty`] for an empty MPO; and
+    /// [`MPOError::IndexOutOfBounds`] for an out-of-range site index.
     ///
     pub fn evaluate(&mut self, indices: &[(usize, usize)]) -> Result<T> {
         if indices.len() != self.len() {
@@ -203,7 +206,7 @@ where
         let (i0, j0) = indices[0];
 
         // Sum over shared index k
-        let mut current: Matrix2<T> = matrix2_zeros(first_a.right_dim(), first_b.right_dim());
+        let mut current: Matrix2<T> = matrix2_zeros(first_a.right_dim(), first_b.right_dim())?;
         for k in 0..first_a.site_dim_2() {
             for ra in 0..first_a.right_dim() {
                 for rb in 0..first_b.right_dim() {
@@ -220,7 +223,7 @@ where
             let b = self.mpo_b.site_tensor(site);
             let (i_k, j_k) = indices[site];
 
-            let mut new_current: Matrix2<T> = matrix2_zeros(a.right_dim(), b.right_dim());
+            let mut new_current: Matrix2<T> = matrix2_zeros(a.right_dim(), b.right_dim())?;
 
             for la in 0..a.left_dim() {
                 for lb in 0..b.left_dim() {
@@ -264,8 +267,9 @@ where
     /// Returns L\[n\] = product of sites 0..n
     /// # Errors
     ///
-    /// Returns an error when the left evaluation fails (a shape or index
-    /// mismatch, or a backend failure).
+    /// Returns [`MPOError::InvalidOperation`] when `n` exceeds the site count,
+    /// when `indices` is shorter than `n`, or when an environment allocation
+    /// fails, and [`MPOError::IndexOutOfBounds`] for an out-of-range index.
     ///
     pub fn evaluate_left(&mut self, n: usize, indices: &[(usize, usize)]) -> Result<Matrix2<T>> {
         if n > self.len() {
@@ -275,7 +279,7 @@ where
         }
 
         if n == 0 {
-            let mut env: Matrix2<T> = matrix2_zeros(1, 1);
+            let mut env: Matrix2<T> = matrix2_zeros(1, 1)?;
             env[[0, 0]] = T::one();
             return Ok(env);
         }
@@ -299,7 +303,7 @@ where
         let b = self.mpo_b.site_tensor(n - 1);
         let (i_k, j_k) = indices[n - 1];
 
-        let mut new_env: Matrix2<T> = matrix2_zeros(a.right_dim(), b.right_dim());
+        let mut new_env: Matrix2<T> = matrix2_zeros(a.right_dim(), b.right_dim())?;
 
         for la in 0..a.left_dim() {
             for lb in 0..b.left_dim() {
@@ -326,8 +330,10 @@ where
     /// Returns R\[n\] = product of sites n..L
     /// # Errors
     ///
-    /// Returns an error when the right evaluation fails (a shape or index
-    /// mismatch, or a backend failure).
+    /// Returns [`MPOError::InvalidOperation`] when `n` exceeds the site count,
+    /// when `indices` is shorter than the train length, or when an environment
+    /// allocation fails, and [`MPOError::IndexOutOfBounds`] for an out-of-range
+    /// index.
     ///
     pub fn evaluate_right(&mut self, n: usize, indices: &[(usize, usize)]) -> Result<Matrix2<T>> {
         let len = self.len();
@@ -338,7 +344,7 @@ where
         }
 
         if n == len {
-            let mut env: Matrix2<T> = matrix2_zeros(1, 1);
+            let mut env: Matrix2<T> = matrix2_zeros(1, 1)?;
             env[[0, 0]] = T::one();
             return Ok(env);
         }
@@ -368,7 +374,7 @@ where
         let b = self.mpo_b.site_tensor(n);
         let (i_k, j_k) = indices[n];
 
-        let mut new_env: Matrix2<T> = matrix2_zeros(a.left_dim(), b.left_dim());
+        let mut new_env: Matrix2<T> = matrix2_zeros(a.left_dim(), b.left_dim())?;
 
         for ra in 0..a.right_dim() {
             for rb in 0..b.right_dim() {

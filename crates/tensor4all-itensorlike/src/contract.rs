@@ -36,8 +36,10 @@ use crate::tensortrain::TensorTrain;
 ///
 /// # Errors
 ///
-/// Returns an error when the contraction or operation fails (a shape or
-/// index mismatch, or a backend failure).
+/// Returns [`TensorTrainError::InvalidStructure`] when either train is empty
+/// or when their lengths differ, and [`TensorTrainError::OperationError`] when
+/// the SVD truncation policy is invalid or the Fit sweep count is not a
+/// multiple of two.
 ///
 /// Shared entry validation for every contraction route. Both [`contract`] and
 /// [`contract_in`] run exactly this, in this order, so the routes cannot drift
@@ -163,8 +165,10 @@ fn contract_dispatch(
 ///
 /// # Errors
 ///
-/// Returns an error when the contraction or operation fails (a shape or
-/// index mismatch, or a backend failure).
+/// Returns [`TensorTrainError::InvalidStructure`] when either train is empty,
+/// when their lengths differ, or when the underlying TreeTN contraction fails;
+/// returns [`TensorTrainError::OperationError`] when the SVD truncation policy
+/// is invalid or the Fit sweep count is not a multiple of two.
 pub fn contract(
     a: &TensorTrain,
     b: &TensorTrain,
@@ -206,11 +210,10 @@ fn to_treetn_options(options: &ContractOptions) -> TreeTNContractionOptions {
 /// The same algorithm, options and validation as [`contract`]; what differs is
 /// the resource the method's numerical work runs in. With a context, SRC runs
 /// through treetn's `contract_src_with_rng_in` and Zip-up through treetn's
-/// `contract_zipup_with_in` (both context-scoped). Fit and Naive are refused
-/// with a typed error rather than silently run on the process-global context:
-/// treetn has no session-taking twin for their sweep / dense-reference paths
-/// yet, which is recorded in the F7 inventory
-/// (`docs/design/859-f7-consumer-inventory.md`).
+/// `contract_zipup_with_in`, and Fit and Naive through treetn's `contract_in`
+/// dispatch (`contract_fit_in` and the context-scoped dense reference). Every
+/// method therefore runs in the supplied context, never on the process-global
+/// one.
 ///
 /// # Arguments
 /// * `a` - The first tensor train
@@ -223,12 +226,10 @@ fn to_treetn_options(options: &ContractOptions) -> TreeTNContractionOptions {
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`contract`], plus a structural error when the
-/// caller-owned context refuses a Zip-up contraction (including a provenance
-/// or factorization refusal), and a typed
-/// [`TensorTrainError::OperationError`] for the Fit and Naive methods (the
-/// caller-owned route cannot honor the supplied context for those methods
-/// yet).
+/// Returns the same errors as [`contract`], plus
+/// [`TensorTrainError::InvalidStructure`] when the caller-owned context
+/// refuses the contraction (for example a provenance, placement, or
+/// factorization refusal).
 pub fn contract_in(
     a: &TensorTrain,
     b: &TensorTrain,
@@ -334,8 +335,11 @@ impl TensorTrain {
     ///
     /// # Errors
     ///
-    /// Returns an error when the contraction or operation fails (a shape or
-    /// index mismatch, or a backend failure).
+    /// Returns [`TensorTrainError::InvalidStructure`] when either train is
+    /// empty, when their lengths differ, or when the underlying TreeTN
+    /// contraction fails; returns [`TensorTrainError::OperationError`] when the
+    /// SVD truncation policy is invalid or the Fit sweep count is not a
+    /// multiple of two.
     ///
     pub fn contract(&self, other: &Self, options: &ContractOptions) -> Result<Self> {
         contract(self, other, options)
@@ -349,8 +353,8 @@ impl TensorTrain {
     ///
     /// # Errors
     ///
-    /// Returns an error when the pair is incompatible (a shape or index mismatch)
-    /// or the contraction fails (a backend failure).
+    /// Returns the same [`TensorTrainError`] variants as
+    /// [`TensorTrain::contract`].
     ///
     pub fn contract_pair(&self, other: &Self, options: &ContractOptions) -> Result<Self> {
         self.contract(other, options)
@@ -359,9 +363,8 @@ impl TensorTrain {
     /// Contract two tensor trains, running the SRC method in a caller-owned
     /// execution context.
     ///
-    /// Same contract as [`crate::contract_in`]: SRC and Zip-up run in the
-    /// caller-owned context; Fit and Naive are refused with a typed error. See
-    /// that function for the inventory record.
+    /// Same contract as [`crate::contract_in`]: every method (SRC, Zip-up, Fit
+    /// and Naive) runs in the caller-owned context.
     ///
     /// # Arguments
     /// * `other` - The other tensor train to contract with
@@ -373,9 +376,10 @@ impl TensorTrain {
     ///
     /// # Errors
     ///
-    /// Returns an error when the pair is incompatible (a shape or index
-    /// mismatch), the contraction fails (a backend failure), or the
-    /// caller-owned context refuses the SRC projection.
+    /// Returns the same errors as [`TensorTrain::contract`], plus
+    /// [`TensorTrainError::InvalidStructure`] when the caller-owned context
+    /// refuses the contraction (for example a provenance, placement, or
+    /// factorization refusal).
     pub fn contract_in(
         &self,
         other: &Self,

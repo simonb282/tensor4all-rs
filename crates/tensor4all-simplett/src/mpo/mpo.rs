@@ -29,8 +29,9 @@ impl<T: TTScalar> MPO<T> {
     /// where the right_bond of tensor i equals the left_bond of tensor i+1.
     /// # Errors
     ///
-    /// Returns an error when the MPO dimensions are invalid (a shape mismatch) or
-    /// the construction fails.
+    /// Returns [`MPOError::BondDimensionMismatch`] when adjacent bond
+    /// dimensions disagree, or [`MPOError::InvalidBoundary`] when the first or
+    /// last tensor does not have a unit boundary bond.
     ///
     pub fn new(tensors: Vec<Tensor4<T>>) -> Result<Self> {
         // Validate dimensions
@@ -66,22 +67,32 @@ impl<T: TTScalar> MPO<T> {
     }
 
     /// Create an MPO representing the zero operator
-    pub fn zeros(site_dims: &[(usize, usize)]) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MPOError::InvalidOperation`] when a site tensor shape product
+    /// overflows `usize`, allocation fails, or the backend rejects the shape.
+    pub fn zeros(site_dims: &[(usize, usize)]) -> Result<Self> {
         let tensors: Vec<Tensor4<T>> = site_dims
             .iter()
             .map(|&(d1, d2)| tensor4_zeros(1, d1, d2, 1))
-            .collect();
-        Self { tensors }
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { tensors })
     }
 
     /// Create an MPO representing a constant operator
     ///
     /// Each element O[i1, j1, i2, j2, ..., iL, jL] = value
-    pub fn constant(site_dims: &[(usize, usize)], value: T) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MPOError::InvalidOperation`] when a site tensor shape product
+    /// overflows `usize`, allocation fails, or the backend rejects the shape.
+    pub fn constant(site_dims: &[(usize, usize)], value: T) -> Result<Self> {
         if site_dims.is_empty() {
-            return Self {
+            return Ok(Self {
                 tensors: Vec::new(),
-            };
+            });
         }
 
         let n = site_dims.len();
@@ -89,7 +100,7 @@ impl<T: TTScalar> MPO<T> {
 
         // First tensor: all ones
         let (d1, d2) = site_dims[0];
-        let mut first = tensor4_zeros(1, d1, d2, 1);
+        let mut first = tensor4_zeros(1, d1, d2, 1)?;
         for s1 in 0..d1 {
             for s2 in 0..d2 {
                 first.set4(0, s1, s2, 0, T::one());
@@ -100,7 +111,7 @@ impl<T: TTScalar> MPO<T> {
         // Middle tensors: all ones (only if n > 2)
         if n > 2 {
             for &(d1, d2) in &site_dims[1..n - 1] {
-                let mut tensor = tensor4_zeros(1, d1, d2, 1);
+                let mut tensor = tensor4_zeros(1, d1, d2, 1)?;
                 for s1 in 0..d1 {
                     for s2 in 0..d2 {
                         tensor.set4(0, s1, s2, 0, T::one());
@@ -113,7 +124,7 @@ impl<T: TTScalar> MPO<T> {
         // Last tensor: multiply by value
         if n > 1 {
             let (d1, d2) = site_dims[n - 1];
-            let mut last = tensor4_zeros(1, d1, d2, 1);
+            let mut last = tensor4_zeros(1, d1, d2, 1)?;
             for s1 in 0..d1 {
                 for s2 in 0..d2 {
                     last.set4(0, s1, s2, 0, value);
@@ -131,7 +142,7 @@ impl<T: TTScalar> MPO<T> {
             }
         }
 
-        Self { tensors }
+        Ok(Self { tensors })
     }
 
     /// Create an identity MPO (only when site_dim_1 == site_dim_2 at each site)
@@ -139,8 +150,8 @@ impl<T: TTScalar> MPO<T> {
     /// The identity operator: O[i1, j1, ...] = delta(i1, j1) * delta(i2, j2) * ...
     /// # Errors
     ///
-    /// Returns an error when the identity MPO construction fails (a shape
-    /// mismatch or backend failure).
+    /// Returns [`MPOError::InvalidOperation`] when a site tensor shape product
+    /// overflows `usize`, allocation fails, or the backend rejects the shape.
     ///
     pub fn identity(site_dims: &[usize]) -> Result<Self> {
         if site_dims.is_empty() {
@@ -152,7 +163,7 @@ impl<T: TTScalar> MPO<T> {
         let mut tensors = Vec::with_capacity(site_dims.len());
 
         for &d in site_dims {
-            let mut tensor = tensor4_zeros(1, d, d, 1);
+            let mut tensor = tensor4_zeros(1, d, d, 1)?;
             for s in 0..d {
                 tensor.set4(0, s, s, 0, T::one());
             }
@@ -239,8 +250,10 @@ impl<T: TTScalar> MPO<T> {
     /// [i1, j1, i2, j2, ..., iL, jL]
     /// # Errors
     ///
-    /// Returns an error when the MPO evaluation fails (a shape or index
-    /// mismatch, or a backend failure).
+    /// Returns [`MPOError::InvalidOperation`] when `indices` does not have two
+    /// entries per site, when an intermediate contraction fails, or when the
+    /// final contraction is not scalar; [`MPOError::Empty`] for an empty MPO;
+    /// and [`MPOError::IndexOutOfBounds`] for an out-of-range physical index.
     ///
     pub fn evaluate(&self, indices: &[LocalIndex]) -> Result<T>
     where
@@ -318,26 +331,19 @@ impl<T: TTScalar> MPO<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the tenferro-backed contraction fails (a backend
-    /// failure) or an internally constructed MPO has inconsistent bond
-    /// dimensions (a shape mismatch).
+    /// Returns [`MPOError::InvalidOperation`] when a tenferro-backed reduction
+    /// or read fails, or when an internally constructed MPO is inconsistent.
     ///
     /// # Examples
     ///
     /// ```
     /// use tensor4all_simplett::mpo::MPO;
     ///
-    /// let mpo = MPO::<f64>::constant(&[(2, 2)], 3.0);
+    /// let mpo = MPO::<f64>::constant(&[(2, 2)], 3.0).unwrap();
     /// let sum = mpo.sum().unwrap();
     /// assert!((sum - 12.0).abs() < 1e-10);
     /// ```
     #[allow(clippy::needless_range_loop)]
-    /// # Errors
-    ///
-    /// Returns an error when the tenferro-backed contraction fails (a backend
-    ///     /// failure) or an internally constructed MPO is inconsistent (an
-    ///     /// invalid-state failure).
-    ///
     pub fn sum(&self) -> Result<T>
     where
         T: EinsumScalar,

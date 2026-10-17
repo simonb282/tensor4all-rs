@@ -120,8 +120,8 @@ impl SVDScalar for Complex64 {
 /// traits and should use `factorize_lu` directly.
 /// # Errors
 ///
-/// Returns an error when the factorization fails (a non-convergence, singular,
-/// or backend failure).
+/// Returns [`MPOError::FactorizationError`] when the SVD computation fails,
+/// when an empty matrix is factorized, or when an output cannot be read.
 ///
 pub fn factorize<T: SVDScalar>(
     matrix: &Matrix2<T>,
@@ -257,8 +257,8 @@ fn factorize_svd<T: SVDScalar>(
     };
 
     // Build result matrices
-    let mut left: Matrix2<T> = matrix2_zeros(m, rank);
-    let mut right: Matrix2<T> = matrix2_zeros(rank, n);
+    let mut left: Matrix2<T> = matrix2_zeros(m, rank)?;
+    let mut right: Matrix2<T> = matrix2_zeros(rank, n)?;
 
     if options.left_orthogonal {
         // Left = U[:, :rank], Right = diag(S[:rank]) * Vt[:rank, :]
@@ -322,8 +322,9 @@ fn factorize_rsvd<T: SVDScalar>(
 /// matching the SVD path.
 /// # Errors
 ///
-/// Returns an error when the LU factorization fails (a singular or backend
-/// failure).
+/// Returns [`MPOError::MatrixCI`] when the LU/CI factorization fails (for
+/// example a singular matrix), or [`MPOError::InvalidOperation`] when a factor
+/// matrix cannot be allocated.
 ///
 pub fn factorize_lu<T>(
     matrix: &Matrix2<T>,
@@ -361,7 +362,7 @@ where
     // Convert back to Matrix2
     let left_m = left_ci.nrows();
     let left_n = left_ci.ncols();
-    let mut left: Matrix2<T> = matrix2_zeros(left_m, left_n);
+    let mut left: Matrix2<T> = matrix2_zeros(left_m, left_n)?;
     for i in 0..left_m {
         for j in 0..left_n {
             left[[i, j]] = left_ci[[i, j]];
@@ -370,7 +371,7 @@ where
 
     let right_m = right_ci.nrows();
     let right_n = right_ci.ncols();
-    let mut right: Matrix2<T> = matrix2_zeros(right_m, right_n);
+    let mut right: Matrix2<T> = matrix2_zeros(right_m, right_n)?;
     for i in 0..right_m {
         for j in 0..right_n {
             right[[i, j]] = right_ci[[i, j]];
@@ -391,8 +392,8 @@ where
 /// Use this directly when you need CI-based factorization.
 /// # Errors
 ///
-/// Returns an error when the cross-interpolation factorization fails (a
-/// non-convergence or backend failure).
+/// Returns the same errors as [`factorize_lu`]: [`MPOError::MatrixCI`] or
+/// [`MPOError::InvalidOperation`].
 ///
 pub fn factorize_ci<T>(
     matrix: &Matrix2<T>,

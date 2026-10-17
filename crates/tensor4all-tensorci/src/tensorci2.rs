@@ -14,9 +14,8 @@ use tensor4all_core::{
     matrix_luci_factors_from_matrix_owned_on_session, MatrixLuciFactors, MatrixLuciScalar,
     MultiIndex, RrLUOptions, Scalar,
 };
-use tensor4all_simplett::{
-    tensor3_zeros, try_tensor3_zeros, SimpleTensorTrain, TTScalar, Tensor3, Tensor3Ops,
-};
+use tensor4all_simplett::{tensor3_zeros, SimpleTensorTrain, TTScalar, Tensor3, Tensor3Ops};
+use tensor4all_tensorbackend::invariant_violated;
 use tensor4all_tensorbackend::{
     explicit::Session, solve_matrix, transpose, BackendLinalgError, Matrix, MatrixSolveScalar,
 };
@@ -446,8 +445,8 @@ where
     /// Create a new empty TensorCI2
     /// # Errors
     ///
-    /// Returns an error when the options or input dimensions are invalid (an
-    /// invalid-configuration failure).
+    /// Returns [`TCIError::DimensionMismatch`] when `local_dims` has fewer than
+    /// two entries, and [`TCIError::InvalidConfiguration`] when an entry is zero.
     ///
     pub fn new(local_dims: Vec<usize>) -> Result<Self> {
         if local_dims.len() < 2 {
@@ -466,7 +465,10 @@ where
             i_set: (0..n).map(|_| Vec::new()).collect(),
             j_set: (0..n).map(|_| Vec::new()).collect(),
             local_dims: local_dims.clone(),
-            site_tensors: local_dims.iter().map(|&d| tensor3_zeros(0, d, 0)).collect(),
+            site_tensors: local_dims
+                .iter()
+                .map(|&d| tensor3_zeros(0, d, 0))
+                .collect::<std::result::Result<_, _>>()?,
             pivot_errors: Vec::new(),
             bond_errors: vec![0.0; n.saturating_sub(1)],
             max_sample_value: 0.0,
@@ -642,7 +644,10 @@ where
             i_set,
             j_set,
             local_dims: local_dims.clone(),
-            site_tensors: local_dims.iter().map(|&d| tensor3_zeros(0, d, 0)).collect(),
+            site_tensors: local_dims
+                .iter()
+                .map(|&d| tensor3_zeros(0, d, 0))
+                .collect::<std::result::Result<_, _>>()?,
             pivot_errors: Vec::new(),
             bond_errors: vec![0.0; n - 1],
             max_sample_value,
@@ -723,8 +728,8 @@ where
     /// Convert to SimpleTensorTrain
     /// # Errors
     ///
-    /// Returns an error when the conversion fails (a shape or index mismatch, or
-    /// a backend failure).
+    /// Returns [`TCIError::SimpleTensorTrain`] when the site tensors do not
+    /// form a valid tensor train.
     ///
     pub fn to_tensor_train(&self) -> Result<SimpleTensorTrain<T>> {
         let tensors = self.site_tensors.clone();
@@ -734,8 +739,9 @@ where
     /// Add global pivots to the TCI
     /// # Errors
     ///
-    /// Returns an error when a pivot is invalid (an invalid-index or
-    /// out-of-bounds failure).
+    /// Returns [`TCIError::DimensionMismatch`] when a pivot's length differs
+    /// from the number of sites, and [`TCIError::IndexOutOfBounds`] when a
+    /// pivot value is out of range for its site.
     ///
     pub fn add_global_pivots(&mut self, pivots: &[MultiIndex]) -> Result<()> {
         // Validate the complete batch before mutating any index set.
@@ -795,7 +801,13 @@ where
     /// Invalidate all site tensors
     pub fn invalidate_site_tensors(&mut self) {
         for p in 0..self.len() {
-            self.site_tensors[p] = tensor3_zeros(0, self.local_dims[p], 0);
+            self.site_tensors[p] =
+                tensor3_zeros(0, self.local_dims[p], 0).unwrap_or_else(|error| {
+                    invariant_violated(
+                        "a zero-size site tensor allocates nothing and cannot fail",
+                        error,
+                    )
+                });
         }
     }
 
@@ -812,8 +824,8 @@ where
     /// # Errors
     ///
     /// Returns [`TCIError::InvalidConfiguration`] for invalid tolerances, iteration/history limits, or an
-    /// invalid optional bond dimension. It also returns an error for a shape or index mismatch, a non-convergence
-    /// failure, or a backend failure.
+    /// invalid optional bond dimension, and [`TCIError::InvalidOperation`], [`TCIError::MatrixCIError`], or
+    /// [`TCIError::SimpleTensorTrain`] when a candidate matrix, site layout, factorization, or solve fails.
     pub fn sweep2site<F, B>(
         &mut self,
         f: &F,
@@ -835,9 +847,10 @@ where
     /// # Errors
     ///
     /// Returns [`TCIError::InvalidConfiguration`] for invalid tolerances,
-    /// iteration/history limits, or an invalid optional bond dimension. It
-    /// also returns an error for a shape or index mismatch, a non-convergence
-    /// failure, or a backend failure.
+    /// iteration/history limits, or an invalid optional bond dimension, and
+    /// [`TCIError::InvalidOperation`], [`TCIError::MatrixCIError`], or
+    /// [`TCIError::SimpleTensorTrain`] when a candidate matrix, site layout,
+    /// factorization, or solve fails.
     ///
     fn sweep2site_on_session<F, B>(
         &mut self,
@@ -926,7 +939,7 @@ where
         let ni = i_indices.len();
         let nj = j_indices.len();
         let mut tensor =
-            try_tensor3_zeros(ni, local_dim, nj).map_err(|error| TCIError::InvalidOperation {
+            tensor3_zeros(ni, local_dim, nj).map_err(|error| TCIError::InvalidOperation {
                 message: format!("TensorCI2 site tensor construction failed: {error}"),
             })?;
         for (ii, i_multi) in i_indices.iter().enumerate() {
@@ -959,8 +972,8 @@ where
     /// # Errors
     ///
     /// Returns [`TCIError::InvalidConfiguration`] for negative or non-finite tolerances or a zero bond
-    /// dimension. It also returns an error when the one-site sweep fails (a shape or index mismatch, a
-    /// non-convergence failure, or a backend failure).
+    /// dimension, and [`TCIError::InvalidOperation`], [`TCIError::MatrixCIError`], or
+    /// [`TCIError::SimpleTensorTrain`] when a candidate matrix, site layout, factorization, or solve fails.
     pub fn sweep1site<F>(
         &mut self,
         f: &F,
@@ -993,9 +1006,9 @@ where
     /// # Errors
     ///
     /// Returns [`TCIError::InvalidConfiguration`] for negative or non-finite
-    /// tolerances or a zero bond dimension. It also returns an error when the
-    /// one-site sweep fails (a shape or index mismatch, a non-convergence
-    /// failure, or a backend failure).
+    /// tolerances or a zero bond dimension, and [`TCIError::InvalidOperation`],
+    /// [`TCIError::MatrixCIError`], or [`TCIError::SimpleTensorTrain`] when a
+    /// candidate matrix, site layout, factorization, or solve fails.
     ///
     // INVARIANT: the parameter list is the sweep's boundary (evaluator, direction, tolerance pair, bond cap,
     // tensor-update flag) plus the optional execution route; grouping them would only add a layer.
@@ -1132,7 +1145,7 @@ where
             if forward {
                 let left_dim = if b == 0 { 1 } else { self.i_set[b].len() };
                 let right_dim = factors.rank.max(1);
-                let mut tensor = try_tensor3_zeros(left_dim, local_dim, right_dim)?;
+                let mut tensor = tensor3_zeros(left_dim, local_dim, right_dim)?;
                 for l in 0..left_dim {
                     for s in 0..local_dim {
                         for r in 0..right_dim {
@@ -1157,7 +1170,7 @@ where
                 } else {
                     self.j_set[b].len()
                 };
-                let mut tensor = try_tensor3_zeros(left_dim, local_dim, right_dim)?;
+                let mut tensor = tensor3_zeros(left_dim, local_dim, right_dim)?;
                 for l in 0..left_dim {
                     for s in 0..local_dim {
                         for r in 0..right_dim {
@@ -1196,8 +1209,10 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when the site tensors cannot be built (a shape or index mismatch, or a backend
-    /// failure).
+    /// Returns [`TCIError::InvalidOperation`] when a candidate or pivot matrix
+    /// cannot be built, a site-layout offset overflows, or the one-site solve
+    /// fails, and [`TCIError::SimpleTensorTrain`] when a site core cannot be
+    /// constructed.
     pub fn fill_site_tensors<F>(&mut self, f: &F) -> Result<()>
     where
         F: Fn(&MultiIndex) -> T,
@@ -1215,8 +1230,10 @@ where
     /// Port of Julia's `fillsitetensors!` / `setsitetensor!`.
     /// # Errors
     ///
-    /// Returns an error when the site tensors cannot be built (a shape or index
-    /// mismatch, or a backend failure).
+    /// Returns [`TCIError::InvalidOperation`] when a candidate or pivot matrix
+    /// cannot be built, a site-layout offset overflows, or the one-site solve
+    /// fails, and [`TCIError::SimpleTensorTrain`] when a site core cannot be
+    /// constructed.
     ///
     fn fill_site_tensors_on_session<F>(
         &mut self,
@@ -1247,7 +1264,7 @@ where
                 } else {
                     self.i_set[b + 1].len().max(1)
                 };
-                self.site_tensors[b] = try_tensor3_zeros(left_dim, self.local_dims[b], right_dim)?;
+                self.site_tensors[b] = tensor3_zeros(left_dim, self.local_dims[b], right_dim)?;
                 continue;
             }
 
@@ -1271,7 +1288,7 @@ where
                 let left_dim = if b == 0 { 1 } else { self.i_set[b].len() };
                 let site_dim = self.local_dims[b];
                 let right_dim = 1; // last site
-                let mut tensor = try_tensor3_zeros(left_dim, site_dim, right_dim)?;
+                let mut tensor = tensor3_zeros(left_dim, site_dim, right_dim)?;
                 for l in 0..left_dim {
                     for s in 0..site_dim {
                         let row = l
@@ -1312,7 +1329,7 @@ where
                 // core with the same bond shape. Small nonzero values must
                 // still be interpolated, regardless of their absolute scale.
                 if (0..np).all(|i| (0..nj).all(|j| p_mat[[i, j]].is_zero())) {
-                    self.site_tensors[b] = try_tensor3_zeros(left_dim, site_dim, right_dim)?;
+                    self.site_tensors[b] = tensor3_zeros(left_dim, site_dim, right_dim)?;
                     continue;
                 }
 
@@ -1326,7 +1343,7 @@ where
                     })?;
 
                 // X = X_t^T → shape (ni, np) = (|I_b|*d_b, |I_{b+1}|)
-                let mut tensor = try_tensor3_zeros(left_dim, site_dim, right_dim)?;
+                let mut tensor = tensor3_zeros(left_dim, site_dim, right_dim)?;
                 for l in 0..left_dim {
                     for s in 0..site_dim {
                         for r in 0..right_dim {
@@ -1355,8 +1372,8 @@ where
     /// # Errors
     ///
     /// Returns [`TCIError::InvalidConfiguration`] for negative or non-finite tolerances or a zero bond
-    /// dimension. It also returns an error when the canonicalization fails (a shape or index mismatch or a
-    /// backend failure).
+    /// dimension, and [`TCIError::InvalidOperation`], [`TCIError::MatrixCIError`], or
+    /// [`TCIError::SimpleTensorTrain`] when a canonicalization sweep fails.
     pub fn make_canonical<F>(
         &mut self,
         f: &F,
@@ -1380,8 +1397,9 @@ where
     /// # Errors
     ///
     /// Returns [`TCIError::InvalidConfiguration`] for negative or non-finite
-    /// tolerances or a zero bond dimension. It also returns an error when the
-    /// canonicalization fails (a shape or index mismatch or a backend failure).
+    /// tolerances or a zero bond dimension, and [`TCIError::InvalidOperation`],
+    /// [`TCIError::MatrixCIError`], or [`TCIError::SimpleTensorTrain`] when a
+    /// canonicalization sweep fails.
     ///
     fn make_canonical_on_session<F>(
         &mut self,
@@ -2307,7 +2325,7 @@ where
     let site_dim_b = tci.local_dims[b];
     let new_bond_dim = factors.rank.max(1);
 
-    let mut tensor_b = try_tensor3_zeros(left_dim, site_dim_b, new_bond_dim)?;
+    let mut tensor_b = tensor3_zeros(left_dim, site_dim_b, new_bond_dim)?;
     for l in 0..left_dim {
         for s in 0..site_dim_b {
             for r in 0..new_bond_dim {
@@ -2333,7 +2351,7 @@ where
         tci.j_set[b + 1].len()
     };
 
-    let mut tensor_bp1 = try_tensor3_zeros(new_bond_dim, site_dim_bp1, right_dim)?;
+    let mut tensor_bp1 = tensor3_zeros(new_bond_dim, site_dim_bp1, right_dim)?;
     for l in 0..new_bond_dim {
         for s in 0..site_dim_bp1 {
             for r in 0..right_dim {
