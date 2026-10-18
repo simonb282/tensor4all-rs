@@ -5,6 +5,7 @@ use crate::tensor::{
     t4a_tensor_release,
 };
 use crate::types::{t4a_singular_value_measure, t4a_threshold_scale, t4a_truncation_rule};
+use crate::T4A_SUCCESS;
 
 fn last_error() -> String {
     let mut len = 0usize;
@@ -770,6 +771,19 @@ fn test_treetn_split_to_splits_fused_vertex() {
     t4a_treetn_release(split);
     t4a_treetn_release(fused);
     cleanup(tt, tensors, indices);
+}
+
+#[test]
+fn build_swap_options_maps_rtol_to_relative_per_value_policy() {
+    let exact = build_swap_options(0, 0.0);
+    assert_eq!(exact.max_bond_dim, None);
+    assert_eq!(exact.svd_policy, None);
+    assert_eq!(build_swap_options(0, -1.0).svd_policy, None);
+    assert_eq!(build_swap_options(0, f64::NAN).svd_policy, None);
+
+    let truncated = build_swap_options(7, 1e-9);
+    assert_eq!(truncated.max_bond_dim, Some(7));
+    assert_eq!(truncated.svd_policy, Some(SvdTruncationPolicy::new(1e-9)));
 }
 
 #[test]

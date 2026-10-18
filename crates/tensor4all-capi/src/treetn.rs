@@ -6,13 +6,12 @@ use crate::types::{
     InternalTreeTN, InternalTreeTNEvaluatorHandle,
 };
 use crate::{
-    capi_error, clone_opaque, is_assigned_opaque, panic_message, release_opaque, run_catching,
-    set_last_error, t4a_status_code, CapiResult, T4A_BUFFER_TOO_SMALL, T4A_INTERNAL_ERROR,
-    T4A_INVALID_ARGUMENT, T4A_NULL_POINTER, T4A_SUCCESS,
+    capi_error, clone_opaque, is_assigned_opaque, release_opaque, run_catching, run_status,
+    set_last_error, t4a_status_code, CapiResult, T4A_BUFFER_TOO_SMALL, T4A_INVALID_ARGUMENT,
+    T4A_NULL_POINTER,
 };
 use num_complex::Complex64;
 use std::collections::{HashMap, HashSet};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use tensor4all_core::{AnyScalar, ColMajorArrayRef, IndexLike, SvdTruncationPolicy};
 use tensor4all_treetn::contraction::{self, ContractionMethod, ContractionOptions};
 use tensor4all_treetn::{
@@ -104,24 +103,6 @@ fn orthogonalize_error_message(force: libc::c_int, err: impl std::fmt::Display) 
         }
     }
     msg
-}
-
-fn run_status<F>(f: F) -> t4a_status_code
-where
-    F: FnOnce() -> CapiResult<()>,
-{
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(Ok(())) => T4A_SUCCESS,
-        Ok(Err((code, msg))) => {
-            set_last_error(&msg);
-            code
-        }
-        Err(panic) => {
-            let msg = panic_message(&*panic);
-            set_last_error(&msg);
-            T4A_INTERNAL_ERROR
-        }
-    }
 }
 
 fn require_tree<'a>(ptr: *const t4a_treetn) -> CapiResult<&'a t4a_treetn> {
@@ -468,7 +449,7 @@ fn build_split_options(
 fn build_swap_options(maxdim: usize, rtol: f64) -> SwapOptions {
     SwapOptions {
         max_bond_dim: (maxdim > 0).then_some(maxdim),
-        rtol: (rtol > 0.0).then_some(rtol),
+        svd_policy: (rtol > 0.0).then(|| SvdTruncationPolicy::new(rtol)),
     }
 }
 
@@ -1254,6 +1235,15 @@ pub extern "C" fn t4a_treetn_split_to(
 }
 
 /// Reassign site indices to target vertices using scheduled swap transport.
+///
+/// `rtol` is the only singular-value threshold this C entry exposes: a positive
+/// value selects a relative, per-singular-value threshold; zero, negative, or
+/// NaN `rtol` disables threshold-based truncation. A positive `maxdim` still
+/// caps the bond rank, so a swap is exact only with `maxdim = 0` and a
+/// nonpositive `rtol`. The absolute scale,
+/// squared-value measure, and discarded-tail-sum rule of
+/// [`SvdTruncationPolicy`] are not reachable through the C ABI; use the Rust
+/// API when those settings are required.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn t4a_treetn_swap_site_indices(
     treetn: *const t4a_treetn,
@@ -1282,6 +1272,10 @@ pub extern "C" fn t4a_treetn_swap_site_indices(
 }
 
 /// Restructure a TreeTN using split, swap, and optional final truncation phases.
+///
+/// `swap_rtol` uses the same relative, per-singular-value swap policy as
+/// [`t4a_treetn_swap_site_indices`]; other [`SvdTruncationPolicy`] settings are
+/// not reachable through this C ABI.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn t4a_treetn_restructure_to(
     treetn: *const t4a_treetn,
