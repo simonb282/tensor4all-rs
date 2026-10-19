@@ -1,5 +1,6 @@
 use crate::batch::{checked_batch_len, EVALUATION_CHUNK_POINTS};
 use crate::error::Result as TreeTciResult;
+use crate::evaluation::{BatchExecution, CachedExecution, Compatibility, Explicit};
 use crate::optimize::{with_seeded_streams, RandomStreams};
 use crate::{
     materialize::to_treetn_chunked, optimize::optimize_with_streams, AllEdges, GlobalIndexBatch,
@@ -8,6 +9,7 @@ use crate::{
 use anyhow::Result;
 use tensor4all_core::CommonScalar;
 use tensor4all_tensorbackend::FullPivLuScalar;
+use tensor4all_treetn::interpolation::EvalContext;
 use tensor4all_treetn::TreeTN;
 
 /// A materialized tree tensor network with iteration diagnostics and stopping reason.
@@ -141,9 +143,11 @@ where
     P: PivotCandidateProposer,
 {
     options.validate()?;
+    let mut evaluate = evaluate;
+    let mut execution = Compatibility::new(&mut evaluate);
     with_seeded_streams(&options, proposer, |streams| {
         crossinterpolate2_with_streams(
-            evaluate,
+            &mut execution,
             local_dims,
             graph,
             initial_pivots,
@@ -151,7 +155,6 @@ where
             center_site,
             proposer,
             streams,
-            None,
         )
     })
 }
@@ -160,17 +163,19 @@ where
 ///
 /// The same algorithm, options, stopping rule and streaming as [`crossinterpolate2`]; what differs is the
 /// resource the session-bound stages run in. Without a context they go through the process-global CPU context;
-/// with one, the two materializations - the one the global pivot search performs and the final one - run on
-/// the caller's context, through entries that consult no process-global context.
+/// with one, every numerical stage of the run - both materializations, the global-pivot readout and factor
+/// solves - runs on the caller's context, through entries that consult no process-global context.
 ///
-/// **What is not covered, so that this is a budget for part of the stage and not the whole run:** the caller's
-/// own evaluator, the pivot search's readout (which for a homogeneous single-index tree takes raw message
-/// kernels and cached columns, and can still reach the global session for larger grouped messages, narrow
-/// scalars or generic layouts), and physical tensor publication, which adopts into the process-global eager
-/// runtime. **A caller on a Rayon worker cannot use this entry point**: the concrete session entry rejects
-/// worker threads rather than silently serializing or falling back to the global context, so the run fails
-/// typed once a nonzero solve is reached. Call it from a thread that owns its execution, as the scoped and held
-/// CPU session entries require.
+/// **What the context does and does not cover.** The global-pivot search reads its approximation back through
+/// the session's typed cached-evaluator entry, so it neither builds an [`AnyScalar`](tensor4all_core::AnyScalar)
+/// nor enters the eager runtime, for grouped messages, narrow scalars and generic layouts alike. Physical
+/// tensor publication writes compact host storage, so the returned network stays usable after the context
+/// closes and no stage adopts a value into the process-global eager runtime. The caller's own evaluator runs on
+/// the calling thread with the context's session available through its [`EvalContext`], and it is never moved
+/// onto the context's workers. **A caller on a Rayon worker cannot use this entry point**: the concrete session
+/// entry rejects worker threads rather than silently serializing or falling back to the global context, so the
+/// run fails typed once a nonzero solve is reached. Call it from a thread that owns its execution, as the scoped
+/// and held CPU session entries require.
 ///
 /// # Errors
 ///
@@ -185,7 +190,7 @@ where
 /// ```
 /// use tensor4all_treetci::{crossinterpolate2_in, DefaultProposer, TreeTciGraph, TreeTciOptions};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let result = crossinterpolate2_in::<f64, _, _>(
@@ -217,27 +222,36 @@ where
     P: PivotCandidateProposer,
 {
     options.validate()?;
-    with_seeded_streams(&options, proposer, |streams| {
-        crossinterpolate2_with_streams(
-            evaluate,
-            local_dims,
-            graph,
-            initial_pivots,
-            &options,
-            center_site,
-            proposer,
-            streams,
-            Some(context),
-        )
-    })
+    let mut evaluate = evaluate;
+    context
+        .with_concrete_session(|session| {
+            let mut contextual =
+                |batch: GlobalIndexBatch<'_>, _ctx: &mut EvalContext<'_>| evaluate(batch);
+            let mut context = crate::evaluation::serial_context(session);
+            let mut execution = Explicit::new(&mut context, &mut contextual);
+            with_seeded_streams(&options, proposer, |streams| {
+                crossinterpolate2_with_streams(
+                    &mut execution,
+                    local_dims,
+                    graph,
+                    initial_pivots,
+                    &options,
+                    center_site,
+                    proposer,
+                    streams,
+                )
+            })
+        })
+        .map_err(|error| crate::TreeTciError::from(anyhow::Error::new(error)))?
 }
 
 /// Interpolate a tree tensor network on a caller-owned random stream and execution context.
 ///
 /// The caller-stream counterpart of [`crossinterpolate2_in`]: the supplied stream drives every global pivot
-/// search, and the optimizer's global-pivot work and the materialization solve run in `context`. The two are
-/// independent, so a caller can advance its own randomness across runs while keeping those stages' budget to
-/// itself. Physical tensor publication still adopts into the process-global eager runtime.
+/// search, and the optimizer's global-pivot work, its readout and the materialization solve run in `context`.
+/// The two are independent, so a caller can advance its own randomness across runs while keeping those stages'
+/// budget to itself. Physical tensor publication writes compact host storage, so nothing is adopted into the
+/// process-global eager runtime.
 ///
 /// # Errors
 ///
@@ -252,7 +266,7 @@ where
 /// use rand_chacha::ChaCha8Rng;
 /// use tensor4all_treetci::{crossinterpolate2_with_rng_in, DefaultProposer, TreeTciGraph, TreeTciOptions};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let mut rng = ChaCha8Rng::seed_from_u64(0);
@@ -288,17 +302,25 @@ where
 {
     let mut stream: &mut R = rng;
     let mut streams = RandomStreams::Shared(&mut stream);
-    crossinterpolate2_with_streams(
-        evaluate,
-        local_dims,
-        graph,
-        initial_pivots,
-        &options,
-        center_site,
-        proposer,
-        &mut streams,
-        Some(context),
-    )
+    let mut evaluate = evaluate;
+    context
+        .with_concrete_session(|session| {
+            let mut contextual =
+                |batch: GlobalIndexBatch<'_>, _ctx: &mut EvalContext<'_>| evaluate(batch);
+            let mut context = crate::evaluation::serial_context(session);
+            let mut execution = Explicit::new(&mut context, &mut contextual);
+            crossinterpolate2_with_streams(
+                &mut execution,
+                local_dims,
+                graph,
+                initial_pivots,
+                &options,
+                center_site,
+                proposer,
+                &mut streams,
+            )
+        })
+        .map_err(|error| crate::TreeTciError::from(anyhow::Error::new(error)))?
 }
 
 /// Interpolate a tree tensor network on a caller-owned random stream.
@@ -362,8 +384,10 @@ where
 {
     let mut stream: &mut R = rng;
     let mut streams = RandomStreams::Shared(&mut stream);
+    let mut evaluate = evaluate;
+    let mut execution = Compatibility::new(&mut evaluate);
     crossinterpolate2_with_streams(
-        evaluate,
+        &mut execution,
         local_dims,
         graph,
         initial_pivots,
@@ -371,15 +395,14 @@ where
         center_site,
         proposer,
         &mut streams,
-        None,
     )
 }
 
 // INVARIANT: This shared run boundary preserves the eight explicit parameters
 // of the public caller-stream entry point without bundling unrelated options.
 #[allow(clippy::too_many_arguments)]
-fn crossinterpolate2_with_streams<T, F, P>(
-    evaluate: F,
+fn crossinterpolate2_with_streams<T, P>(
+    execution: &mut dyn BatchExecution<T>,
     local_dims: Vec<usize>,
     graph: TreeTciGraph,
     initial_pivots: Vec<MultiIndex>,
@@ -387,7 +410,6 @@ fn crossinterpolate2_with_streams<T, F, P>(
     center_site: Option<usize>,
     proposer: &P,
     streams: &mut RandomStreams<'_>,
-    context: Option<&tensor4all_tensorbackend::CpuExecutionContext>,
 ) -> TreeTciResult<TreeTciRunResult>
 where
     T: FullPivLuScalar
@@ -395,7 +417,6 @@ where
         + tensor4all_core::MatrixLuciScalar
         + tensor4all_core::TensorElement
         + crate::globalpivot::ScalarParts,
-    F: FnMut(GlobalIndexBatch<'_>) -> Result<Vec<T>>,
     P: PivotCandidateProposer,
 {
     options.validate()?;
@@ -417,12 +438,8 @@ where
     let mut tci = TreeTCI2::<T>::new(local_dims, graph)?;
     tci.add_global_pivots(&pivots)?;
 
-    let evaluator = crate::evaluation::RunEvaluator::new(
-        evaluate,
-        &tci.local_dims,
-        options.evaluation_cache_bytes,
-    )?;
-    let evaluate = |batch: GlobalIndexBatch<'_>| evaluator.call(batch);
+    let mut evaluator =
+        CachedExecution::new(execution, &tci.local_dims, options.evaluation_cache_bytes)?;
 
     // Initialize max_sample_value via batch evaluate
     let n_sites = tci.local_dims.len();
@@ -432,7 +449,7 @@ where
         flat.extend_from_slice(pivot);
     }
     let batch = GlobalIndexBatch::new(&flat, n_sites, pivots.len())?;
-    let init_vals = evaluate(batch)?;
+    let init_vals = evaluator.call(batch)?;
     if init_vals.len() != pivots.len() {
         return Err(anyhow::anyhow!(
             "initial evaluator returned {} values for {} pivots",
@@ -453,15 +470,14 @@ where
     }
 
     let result = optimize_with_streams(
-        &mut tci, evaluate, options, proposer, &AllEdges, streams, context,
+        &mut tci,
+        &mut evaluator,
+        options,
+        proposer,
+        &AllEdges,
+        streams,
     )?;
-    let treetn = to_treetn_chunked(
-        &tci,
-        &evaluate,
-        center_site,
-        EVALUATION_CHUNK_POINTS,
-        context,
-    )?;
+    let treetn = to_treetn_chunked(&tci, &mut evaluator, center_site, EVALUATION_CHUNK_POINTS)?;
 
     Ok(TreeTciRunResult {
         treetn,

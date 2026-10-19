@@ -43,7 +43,10 @@ use crate::named_graph::NamedGraph;
 use crate::site_index_network::SiteIndexNetwork;
 
 // Re-export the decomposition functions and types
-pub use decompose::{factorize_tensor_to_treetn, factorize_tensor_to_treetn_with, TreeTopology};
+pub use decompose::{
+    factorize_tensor_to_treetn, factorize_tensor_to_treetn_with,
+    factorize_tensor_to_treetn_with_on_session, TreeTopology,
+};
 
 // Re-export cached evaluator types
 pub use cached_evaluator::{
@@ -122,6 +125,35 @@ where
     T: TensorLike,
     F: FnOnce(&T, &[T::Index]) -> Result<tensor4all_core::FactorizeResult<T>>,
 {
+    factorize_allowing_empty_side_with(
+        tensor,
+        left_indices,
+        factorize,
+        global_stack::<T>,
+        global_select::<T>,
+    )
+}
+
+/// [`factorize_allowing_empty_side`] with the singleton-axis moves supplied by
+/// the caller.
+///
+/// The process-global route stacks and selects eagerly; a caller that holds an
+/// explicit session must do both on that session, because an eager entry is
+/// rejected while a session is active. The factorization and the exactness
+/// contract are identical on every route.
+fn factorize_allowing_empty_side_with<T, F, Stack, Select>(
+    tensor: &T,
+    left_indices: &[T::Index],
+    factorize: F,
+    stack: Stack,
+    select: Select,
+) -> Result<tensor4all_core::FactorizeResult<T>>
+where
+    T: TensorLike,
+    F: FnOnce(&T, &[T::Index]) -> Result<tensor4all_core::FactorizeResult<T>>,
+    Stack: Fn(&T, T::Index, isize) -> Result<T>,
+    Select: Fn(&T, &T::Index, usize) -> Result<T>,
+{
     let tensor_indices = tensor.external_indices();
     if let Some(missing) = left_indices
         .iter()
@@ -140,21 +172,17 @@ where
 
     let left_boundary = T::Index::new_link(1).context("failed to create left boundary")?;
     let right_boundary = T::Index::new_link(1).context("failed to create right boundary")?;
-    let augmented = T::stack_along_new_index(&[tensor], left_boundary.clone(), -1)
-        .and_then(|with_left| T::stack_along_new_index(&[&with_left], right_boundary.clone(), -1))
+    let augmented = stack(tensor, left_boundary.clone(), -1)
+        .and_then(|with_left| stack(&with_left, right_boundary.clone(), -1))
         .context("failed to add singleton boundaries for factorization")?;
     let mut augmented_left = left_indices.to_vec();
     augmented_left.push(left_boundary.clone());
 
     let result = factorize(&augmented, &augmented_left)
         .context("failed to factorize singleton-boundary tensor")?;
-    let left = result
-        .left
-        .select_indices(std::slice::from_ref(&left_boundary), &[0])
+    let left = select(&result.left, &left_boundary, 0)
         .context("failed to remove left singleton boundary")?;
-    let right = result
-        .right
-        .select_indices(std::slice::from_ref(&right_boundary), &[0])
+    let right = select(&result.right, &right_boundary, 0)
         .context("failed to remove right singleton boundary")?;
 
     Ok(tensor4all_core::FactorizeResult::new(
@@ -164,6 +192,19 @@ where
         result.singular_values,
         result.rank,
     ))
+}
+
+/// Add a dimension-one axis eagerly, the process-global singleton move.
+fn global_stack<T: TensorLike>(tensor: &T, index: T::Index, axis: isize) -> Result<T> {
+    T::stack_along_new_index(&[tensor], index, axis).map_err(anyhow::Error::from)
+}
+
+/// Select position zero of a dimension-one axis eagerly, the process-global
+/// singleton move.
+fn global_select<T: TensorLike>(tensor: &T, index: &T::Index, position: usize) -> Result<T> {
+    tensor
+        .select_indices(std::slice::from_ref(index), &[position])
+        .map_err(anyhow::Error::from)
 }
 
 /// Contract two local tensors that may share no index.
@@ -794,6 +835,65 @@ where
         context_name: &str,
         context: Option<&tensor4all_tensorbackend::ExecutionContext>,
     ) -> Result<()> {
+        match context {
+            Some(execution) => self.sweep_edge_full_rank_with(
+                src,
+                dst,
+                alg,
+                context_name,
+                |tensor, left| {
+                    tensor
+                        .factorize_full_rank_in(left, alg, canonical, execution)
+                        .map_err(anyhow::Error::from)
+                },
+                |lhs, rhs| T::contract(&[lhs, rhs]).map_err(anyhow::Error::from),
+                global_stack::<T>,
+                global_select::<T>,
+            ),
+            None => self.sweep_edge_full_rank_with(
+                src,
+                dst,
+                alg,
+                context_name,
+                |tensor, left| {
+                    tensor
+                        .factorize_full_rank(left, alg, canonical)
+                        .map_err(anyhow::Error::from)
+                },
+                |lhs, rhs| T::contract(&[lhs, rhs]).map_err(anyhow::Error::from),
+                global_stack::<T>,
+                global_select::<T>,
+            ),
+        }
+    }
+
+    /// Process one edge with caller-supplied factorization and absorption.
+    ///
+    /// The single body behind the process-global, execution-context and
+    /// explicit-session full-rank sweeps: only where the factorization and the
+    /// dst absorption run differs, so a site-free node and the exactness
+    /// contract stay identical on every route.
+    // INVARIANT: the parameters are the seam's boundary (positions, algorithm,
+    // factorization, contraction, and the two singleton-axis moves); grouping
+    // them into a struct would only move the same values through one more layer.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_edge_full_rank_with<Factorize, Contract, Stack, Select>(
+        &mut self,
+        src: NodeIndex,
+        dst: NodeIndex,
+        alg: FactorizeAlg,
+        context_name: &str,
+        factorize: Factorize,
+        contract: Contract,
+        stack: Stack,
+        select: Select,
+    ) -> Result<()>
+    where
+        Factorize: FnOnce(&T, &[T::Index]) -> Result<tensor4all_core::FactorizeResult<T>>,
+        Contract: FnOnce(&T, &T) -> Result<T>,
+        Stack: Fn(&T, T::Index, isize) -> Result<T>,
+        Select: Fn(&T, &T::Index, usize) -> Result<T>,
+    {
         // Find edge between src and dst
         let edge = {
             let g = self.graph.graph();
@@ -842,24 +942,24 @@ where
         // leaves a unit-modulus scalar on a fresh dimension-one bond and moves
         // the whole source tensor into `dst`, which is exact for any bond
         // dimension.
-        let factorize_result =
-            factorize_allowing_empty_side(tensor_src, &left_inds, |tensor, left| {
-                match context {
-                    Some(execution) => {
-                        tensor.factorize_full_rank_in(left, alg, canonical, execution)
-                    }
-                    None => tensor.factorize_full_rank(left, alg, canonical),
-                }
-                .with_context(|| format!("{alg:?} full-rank factorization failed"))
-            })
-            .map_err(|error| {
-                // Keep the whole chain as the source, and name its root cause
-                // (for example the rank-zero bond of an LU/CI split of a zero
-                // tensor) in the top-level message, which is all that
-                // `TreeTNOperationError`'s `Display` shows.
-                let cause = error.root_cause().to_string();
-                error.context(format!("{context_name}: factorization failed: {cause}"))
-            })?;
+        let factorize_result = factorize_allowing_empty_side_with(
+            tensor_src,
+            &left_inds,
+            |tensor, left| {
+                factorize(tensor, left)
+                    .with_context(|| format!("{alg:?} full-rank factorization failed"))
+            },
+            stack,
+            select,
+        )
+        .map_err(|error| {
+            // Keep the whole chain as the source, and name its root cause
+            // (for example the rank-zero bond of an LU/CI split of a zero
+            // tensor) in the top-level message, which is all that
+            // `TreeTNOperationError`'s `Display` shows.
+            let cause = error.root_cause().to_string();
+            error.context(format!("{context_name}: factorization failed: {cause}"))
+        })?;
 
         let left_tensor = factorize_result.left;
         let right_tensor = factorize_result.right;
@@ -870,7 +970,7 @@ where
             .ok_or_else(|| anyhow::anyhow!("Tensor not found for dst node {:?}", dst))
             .with_context(|| format!("{}: dst tensor not found", context_name))?;
 
-        let updated_dst_tensor = T::contract(&[tensor_dst, &right_tensor]).with_context(|| {
+        let updated_dst_tensor = contract(tensor_dst, &right_tensor).with_context(|| {
             format!(
                 "{}: failed to absorb right factor into dst tensor",
                 context_name
@@ -1410,7 +1510,7 @@ where
     /// use tensor4all_core::{DynIndex, ExecutionContext, IdxTensor, TensorConstructionLike};
     /// use tensor4all_tensorbackend::CpuExecutionContext;
     /// use tensor4all_treetn::TreeTN;
-    /// use tenferro_cpu::CpuBackend;
+    /// use tensor4all_tensorbackend::CpuBackend;
     ///
     /// let context = ExecutionContext::Cpu(Arc::new(
     ///     CpuExecutionContext::from_backend(CpuBackend::new()),

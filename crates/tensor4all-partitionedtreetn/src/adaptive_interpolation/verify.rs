@@ -15,6 +15,8 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use tensor4all_core::{ColMajorArrayRef, CommonScalar, DynIndex, IdxTensor, TensorElement};
+use tensor4all_tensorbackend::explicit::Session;
+use tensor4all_treetn::interpolation::EvalContext;
 use tensor4all_treetn::{
     CachedEvaluatorOptions, EvaluationHint, TreeTN, TreeTNCachedEvaluator, TreeTNOperationError,
 };
@@ -38,6 +40,7 @@ pub(super) fn network_values<T, V>(
     network: &TreeTN<IdxTensor, V>,
     sites: &[DynIndex],
     points: &[usize],
+    session: &mut Session<'_>,
 ) -> Result<Vec<T>, TreeTNOperationError>
 where
     T: TensorElement,
@@ -58,7 +61,11 @@ where
         let shape = [n_sites, chunk.len() / n_sites];
         let batch = ColMajorArrayRef::new(chunk, &shape)
             .map_err(|error| TreeTNOperationError::from(anyhow::Error::new(error)))?;
-        values.extend(evaluator.evaluate_batched_typed::<T>(batch, EvaluationHint::default())?);
+        values.extend(evaluator.evaluate_batched_typed_on_session::<T>(
+            session,
+            batch,
+            EvaluationHint::default(),
+        )?);
     }
     Ok(values)
 }
@@ -159,14 +166,14 @@ where
 
 /// Measure `f - f~` on the points of `plan`. Values of `f` come through the
 /// patch cache; values of the network from [`network_values`].
-pub(super) fn measure<T, F, V>(
-    sampler: &PatchSampler<'_, T, F>,
+pub(super) fn measure<T, V>(
+    sampler: &PatchSampler<'_, T>,
     target: &MeasureTarget<'_, V>,
     plan: PointPlan,
+    ctx: &mut EvalContext<'_>,
 ) -> Result<Measured, MeasureError>
 where
     T: CommonScalar + TensorElement,
-    F: Fn(ColMajorArrayRef<'_, usize>) -> anyhow::Result<Vec<T>>,
     V: Clone + Hash + Eq + Ord + Debug + Send + Sync,
 {
     let n_active = target.active_dims.len();
@@ -179,7 +186,9 @@ where
     let shape = [n_active, n_points];
     let batch = ColMajorArrayRef::new(&flat, &shape)
         .map_err(|error| MeasureError::Evaluator(anyhow::anyhow!("{error}")))?;
-    let values = sampler.sample(batch).map_err(MeasureError::Evaluator)?;
+    let values = sampler
+        .sample(batch, ctx)
+        .map_err(MeasureError::Evaluator)?;
 
     let approximations: Option<Vec<T>> = match target.network {
         None => None,
@@ -195,9 +204,10 @@ where
                         .map(|fixed| fixed.or_else(|| active.next()).unwrap_or_default()),
                 );
             }
-            let values = network_values::<T, V>(network, target.sites, &full).map_err(|error| {
-                MeasureError::Network(format!("evaluating the patch network failed: {error}"))
-            })?;
+            let values = network_values::<T, V>(network, target.sites, &full, ctx.session())
+                .map_err(|error| {
+                    MeasureError::Network(format!("evaluating the patch network failed: {error}"))
+                })?;
             if values.len() != n_points {
                 return Err(MeasureError::Network(format!(
                     "the patch network returned {} values for {n_points} points",
@@ -471,15 +481,15 @@ fn classify(
 }
 
 /// `||f~|| / sqrt(|X|)` from the log-norms of the accepted patches, combined
-/// in the given order; `None` when some log-norm is not finite (`-inf`, a
-/// zero patch, contributes zero).
+/// in the given order; `None` when some log-norm was not measured or is not
+/// finite (`-inf`, a zero patch, contributes zero).
 pub(super) fn approximation_rms(
-    patches: impl Iterator<Item = (Result<f64, TreeTNOperationError>, f64)>,
+    patches: impl Iterator<Item = (Option<f64>, f64)>,
     domain_points: f64,
 ) -> Option<f64> {
     let mut sum = ScaledSquares::default();
     for (log_norm, patch_points) in patches {
-        let log_norm = log_norm.ok()?;
+        let log_norm = log_norm?;
         if log_norm == f64::NEG_INFINITY {
             continue;
         }

@@ -44,7 +44,8 @@ use tenferro_ad::EagerTensor;
 use tensor4all_tensorbackend::{Matrix, TensorElement};
 
 use crate::defaults::svd::{
-    compute_retained_rank, svd_for_factorize, svd_for_factorize_in, SvdFactorizeResult,
+    compute_retained_rank, svd_for_factorize, svd_for_factorize_in, svd_for_factorize_on_session,
+    SvdFactorizeResult,
 };
 use crate::qr::{qr_with, qr_with_in, QrOptions};
 use crate::svd::SvdOptions;
@@ -464,7 +465,7 @@ pub fn factorize_full_rank(
 ///     factorize_in, Canonical, FactorizeAlg,
 /// };
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = ExecutionContext::Cpu(Arc::new(
 ///     CpuExecutionContext::from_backend(CpuBackend::new()),
@@ -600,7 +601,7 @@ fn factorize_svd_with_eager_options_in(
 ) -> Result<FactorizeResult<IdxTensor>, FactorizeError> {
     let result = svd_for_factorize_in(t, left_inds, svd_options, context)
         .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
-    assemble_svd_factors(result, canonical)
+    assemble_svd_factors(result, canonical, &mut global_svd_factor_contraction)
 }
 
 fn factorize_qr_with_options_in(
@@ -659,6 +660,310 @@ fn factorize_qr_with_eager_options_in(
         .ok_or_else(|| anyhow::anyhow!("QR factorization returned Q with no dimensions"))?;
 
     Ok(FactorizeResult::new(q, r, bond_index, None, rank))
+}
+
+/// The eager/global contraction the SVD factor assembly uses.
+fn global_svd_factor_contraction(
+    lhs: &IdxTensor,
+    rhs: &IdxTensor,
+) -> Result<IdxTensor, FactorizeError> {
+    contract_pair(lhs, rhs)
+        .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))
+}
+
+/// Factorize a tensor on a caller-held explicit session.
+///
+/// This is the runtime-free counterpart of [`factorize`] for the concrete (non-AD) frontend: the
+/// index bookkeeping, the truncation/retention policies and the factor assembly are the same code
+/// paths as the eager route, while every decomposition runs on `session` and the factors are
+/// published as plain host-storage [`IdxTensor`]s. Nothing here enters another session or the eager
+/// runtime, so a scheduler-owned lane can call it directly.
+///
+/// QR and SVD are served. LU and CI have no session route (the same restriction as
+/// [`factorize_in`]).
+///
+/// # Errors
+///
+/// Returns [`FactorizeError`] for invalid options, an unsupported storage representation or dtype
+/// (diagonal/structured payloads and tracked or device-resident values are refused), a `Right`
+/// canonical QR request, an LU/CI request, or a rejection by the supplied session.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_core::{
+///     factorize_on_session, DynIndex, FactorizeOptions, IdxTensor, TensorContractionLike,
+/// };
+/// use tensor4all_tensorbackend::{explicit::{HeldSession, Session}, CpuExecutionContext};
+/// use tensor4all_tensorbackend::CpuBackend;
+///
+/// let i = DynIndex::new_dyn(2);
+/// let j = DynIndex::new_dyn(2);
+/// let tensor = IdxTensor::from_dense(vec![i.clone(), j.clone()], vec![1.0_f64, 0.0, 0.0, 1.0])?;
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let backend: CpuBackend = context.with_backend(|backend| backend.clone());
+/// let mut held = HeldSession::open(&backend)?;
+/// let result = held.with_session(|view| {
+///     let mut session = Session::from_backend_session(view.backend());
+///     factorize_on_session(&mut session, &tensor, std::slice::from_ref(&i), &FactorizeOptions::svd())
+/// })?;
+/// held.close()?;
+/// assert_eq!(result.rank, 2);
+/// let reconstructed = result.left.contract_pair(&result.right)?;
+/// assert!(tensor.sub(&reconstructed)?.maxabs()? < 1.0e-12);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn factorize_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+    options: &FactorizeOptions,
+) -> Result<FactorizeResult<IdxTensor>, FactorizeError> {
+    options.validate()?;
+    if t.is_diag() {
+        return Err(FactorizeError::UnsupportedStorage(
+            "Diagonal storage not supported for factorize",
+        ));
+    }
+    if t.tracks_grad() {
+        return Err(FactorizeError::UnsupportedStorage(
+            "a tracked value cannot enter the plain explicit-session route; detach it explicitly before the region",
+        ));
+    }
+    match options.alg {
+        FactorizeAlg::SVD => factorize_svd_with_options_on_session(session, t, left_inds, options),
+        FactorizeAlg::QR => {
+            if options.canonical == Canonical::Right {
+                return Err(FactorizeError::UnsupportedCanonical(
+                    "QR only supports Canonical::Left (would need LQ for right)",
+                ));
+            }
+            let qr_options = if let Some(rtol) = options.qr_rtol {
+                QrOptions::new().with_rtol(rtol)
+            } else {
+                QrOptions::new()
+            };
+            let (q, r) = qr_factors_on_session(session, t, left_inds, &qr_options)
+                .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+            let bond_index = q.indices.last().cloned().ok_or_else(|| {
+                FactorizeError::ComputationError(anyhow::anyhow!(
+                    "QR factorization returned a rank-0 Q tensor"
+                ))
+            })?;
+            let rank = *q.dims().last().ok_or_else(|| {
+                FactorizeError::ComputationError(anyhow::anyhow!(
+                    "QR factorization returned Q with no dimensions"
+                ))
+            })?;
+            Ok(FactorizeResult::new(q, r, bond_index, None, rank))
+        }
+        FactorizeAlg::LU | FactorizeAlg::CI => Err(FactorizeError::UnsupportedStorage(
+            "LU and CI factorization have no explicit-session path",
+        )),
+    }
+}
+
+/// Full-rank factorization on a caller-held explicit session.
+///
+/// The runtime-free counterpart of [`factorize_full_rank`]: the split
+/// bookkeeping and factor assembly are shared with the eager route, while the
+/// decomposition runs on `session` and the factors are published as plain
+/// host-storage [`IdxTensor`]s. Nothing here enters another session or the
+/// eager runtime, so a caller that already owns a held session (TreeTN
+/// canonicalization, for example) can call it directly.
+///
+/// QR and SVD are served. LU and CI have no session route.
+///
+/// # Errors
+///
+/// Returns [`FactorizeError`] for a diagonal, structured or tracked operand, a
+/// `Right` canonical QR request, an LU/CI request, or a rejection by the
+/// supplied session.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_core::{
+///     factorize_full_rank_on_session, Canonical, DynIndex, FactorizeAlg, IdxTensor,
+///     TensorContractionLike,
+/// };
+/// use tensor4all_tensorbackend::{explicit::{HeldSession, Session}, CpuExecutionContext};
+/// use tensor4all_tensorbackend::CpuBackend;
+///
+/// let i = DynIndex::new_dyn(2);
+/// let j = DynIndex::new_dyn(2);
+/// let tensor = IdxTensor::from_dense(vec![i.clone(), j.clone()], vec![1.0_f64, 0.0, 0.0, 1.0])?;
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let backend: CpuBackend = context.with_backend(|backend| backend.clone());
+/// let mut held = HeldSession::open(&backend)?;
+/// let result = held.with_session(|view| {
+///     let mut session = Session::from_backend_session(view.backend());
+///     factorize_full_rank_on_session(
+///         &mut session,
+///         &tensor,
+///         std::slice::from_ref(&i),
+///         FactorizeAlg::QR,
+///         Canonical::Left,
+///     )
+/// })?;
+/// held.close()?;
+/// assert_eq!(result.rank, 2);
+/// let reconstructed = result.left.contract_pair(&result.right)?;
+/// assert!(tensor.sub(&reconstructed)?.maxabs()? < 1e-12);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn factorize_full_rank_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+    alg: FactorizeAlg,
+    canonical: Canonical,
+) -> Result<FactorizeResult<IdxTensor>, FactorizeError> {
+    if t.is_diag() {
+        return Err(FactorizeError::UnsupportedStorage(
+            "Diagonal storage not supported for factorize",
+        ));
+    }
+    if t.tracks_grad() {
+        return Err(FactorizeError::UnsupportedStorage(
+            "a tracked value cannot enter the plain explicit-session route; detach it explicitly before the region",
+        ));
+    }
+    match alg {
+        FactorizeAlg::SVD => {
+            let options = SvdOptions::full_rank();
+            let result = if t.is_f32() {
+                svd_for_factorize_on_session::<f32>(session, t, left_inds, &options)
+            } else if t.is_f64() {
+                svd_for_factorize_on_session::<f64>(session, t, left_inds, &options)
+            } else if t.is_c32() {
+                svd_for_factorize_on_session::<Complex32>(session, t, left_inds, &options)
+            } else if t.is_c64() {
+                svd_for_factorize_on_session::<Complex64>(session, t, left_inds, &options)
+            } else {
+                Err(crate::svd::SvdError::ComputationError(anyhow::anyhow!(
+                    "the explicit-session SVD route serves floating-point tensors"
+                )))
+            }
+            .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+            let mut contract = |lhs: &IdxTensor, rhs: &IdxTensor| {
+                crate::contract_pair_on_session(
+                    session,
+                    lhs,
+                    rhs,
+                    crate::PairwiseContractionOptions::new(),
+                )
+                .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))
+            };
+            assemble_svd_factors(result, canonical, &mut contract)
+        }
+        FactorizeAlg::QR => {
+            if canonical == Canonical::Right {
+                return Err(FactorizeError::UnsupportedCanonical(
+                    "QR only supports Canonical::Left (would need LQ for right)",
+                ));
+            }
+            factorize_qr_full_rank_on_session(session, t, left_inds)
+        }
+        FactorizeAlg::LU | FactorizeAlg::CI => Err(FactorizeError::UnsupportedStorage(
+            "LU and CI factorization have no explicit-session path",
+        )),
+    }
+}
+
+fn factorize_qr_full_rank_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+) -> Result<FactorizeResult<IdxTensor>, FactorizeError> {
+    let options = QrOptions::full_rank();
+    let (q, r) = if t.is_f32() {
+        crate::qr::qr_with_on_session::<f32>(session, t, left_inds, &options)
+    } else if t.is_f64() {
+        crate::qr::qr_with_on_session::<f64>(session, t, left_inds, &options)
+    } else if t.is_c32() {
+        crate::qr::qr_with_on_session::<Complex32>(session, t, left_inds, &options)
+    } else if t.is_c64() {
+        crate::qr::qr_with_on_session::<Complex64>(session, t, left_inds, &options)
+    } else {
+        Err(crate::qr::QrError::ComputationError(anyhow::anyhow!(
+            "the explicit-session QR route serves floating-point tensors"
+        )))
+    }
+    .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+
+    let bond_index = q
+        .indices
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("QR factorization returned a rank-0 Q tensor"))?;
+    let rank = *q
+        .dims()
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("QR factorization returned Q with no dimensions"))?;
+    Ok(FactorizeResult::new(q, r, bond_index, None, rank))
+}
+
+/// Thin QR factors on the caller's session, in the tensor's own scalar type.
+///
+/// The session route keeps the operand dtype instead of narrowing the
+/// factorization to `f64`, so `f32`/`c32` operands factorize without a widening
+/// round trip.
+fn qr_factors_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+    options: &QrOptions,
+) -> Result<(IdxTensor, IdxTensor), crate::qr::QrError> {
+    if t.is_f32() {
+        crate::qr::qr_with_on_session::<f32>(session, t, left_inds, options)
+    } else if t.is_f64() {
+        crate::qr::qr_with_on_session::<f64>(session, t, left_inds, options)
+    } else if t.is_c32() {
+        crate::qr::qr_with_on_session::<Complex32>(session, t, left_inds, options)
+    } else if t.is_c64() {
+        crate::qr::qr_with_on_session::<Complex64>(session, t, left_inds, options)
+    } else {
+        Err(crate::qr::QrError::ComputationError(anyhow::anyhow!(
+            "the explicit-session QR route serves floating-point tensors"
+        )))
+    }
+}
+
+fn factorize_svd_with_options_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+    options: &FactorizeOptions,
+) -> Result<FactorizeResult<IdxTensor>, FactorizeError> {
+    let mut svd_options = SvdOptions::new();
+    if let Some(policy) = options.svd_policy {
+        svd_options = svd_options.with_policy(policy);
+    }
+    if let Some(max_bond_dim) = options.max_bond_dim {
+        svd_options = svd_options.with_max_bond_dim(max_bond_dim);
+    }
+    let result = if t.is_f32() {
+        svd_for_factorize_on_session::<f32>(session, t, left_inds, &svd_options)
+    } else if t.is_f64() {
+        svd_for_factorize_on_session::<f64>(session, t, left_inds, &svd_options)
+    } else if t.is_c32() {
+        svd_for_factorize_on_session::<Complex32>(session, t, left_inds, &svd_options)
+    } else if t.is_c64() {
+        svd_for_factorize_on_session::<Complex64>(session, t, left_inds, &svd_options)
+    } else {
+        Err(crate::svd::SvdError::ComputationError(anyhow::anyhow!(
+            "the explicit-session SVD route serves floating-point tensors"
+        )))
+    }
+    .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+    let mut contract = |lhs: &IdxTensor, rhs: &IdxTensor| -> Result<IdxTensor, FactorizeError> {
+        crate::contract_pair_on_session(session, lhs, rhs, crate::PairwiseContractionOptions::new())
+            .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))
+    };
+    assemble_svd_factors(result, options.canonical, &mut contract)
 }
 
 fn factorize_impl<T>(
@@ -741,7 +1046,7 @@ fn factorize_svd_with_options(
     svd_options: &SvdOptions,
 ) -> Result<FactorizeResult<IdxTensor>, FactorizeError> {
     let result = svd_for_factorize(t, left_inds, svd_options)?;
-    assemble_svd_factors(result, canonical)
+    assemble_svd_factors(result, canonical, &mut global_svd_factor_contraction)
 }
 
 /// Absorb the SVD factors into left/right canonical form.
@@ -751,6 +1056,7 @@ fn factorize_svd_with_options(
 fn assemble_svd_factors(
     result: SvdFactorizeResult,
     canonical: Canonical,
+    contract: &mut dyn FnMut(&IdxTensor, &IdxTensor) -> Result<IdxTensor, FactorizeError>,
 ) -> Result<FactorizeResult<IdxTensor>, FactorizeError> {
     let u = result.u;
     let s = result.s;
@@ -767,8 +1073,7 @@ fn assemble_svd_factors(
     match canonical {
         Canonical::Left => {
             // L = U (orthogonal), R = S * V^H
-            let right_contracted = contract_pair(&s, &vh)
-                .map_err(|e| FactorizeError::ComputationError(anyhow::Error::new(e)))?;
+            let right_contracted = contract(&s, &vh)?;
             let right = right_contracted
                 .replaceind(&sim_bond_index, &bond_index)
                 .map_err(|e| FactorizeError::ComputationError(anyhow::Error::new(e)))?;
@@ -782,8 +1087,7 @@ fn assemble_svd_factors(
         }
         Canonical::Right => {
             // L = U * S, R = V^H
-            let left_contracted = contract_pair(&u, &s)
-                .map_err(|e| FactorizeError::ComputationError(anyhow::Error::new(e)))?;
+            let left_contracted = contract(&u, &s)?;
             let left = left_contracted
                 .replaceind(&sim_bond_index, &bond_index)
                 .map_err(|e| FactorizeError::ComputationError(anyhow::Error::new(e)))?;

@@ -12,6 +12,7 @@
 //! run that stops at `max_iter` or through the bond-dimension saturation stop.
 
 use crate::error::Result as TreeTciResult;
+use crate::evaluation::{BatchExecution, Compatibility};
 use crate::{
     batch::EVALUATION_CHUNK_POINTS, materialize::to_treetn_chunked, GlobalIndexBatch, MultiIndex,
     TreeTCI2,
@@ -21,7 +22,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use tensor4all_core::MatrixLuciScalar as Scalar;
 use tensor4all_core::{floating_zone_walk, AnyScalar, ColMajorArrayRef, DynIndex, IdxTensor};
-use tensor4all_tensorbackend::{CpuExecutionContext, FullPivLuScalar};
+use tensor4all_tensorbackend::FullPivLuScalar;
 use tensor4all_treetn::{CachedEvaluatorOptions, EvaluationHint, TreeTN, TreeTNCachedEvaluator};
 
 /// Search for multi-indices where the current approximation error is large.
@@ -163,15 +164,16 @@ where
     // Erase the caller's RNG type once, so the search body below is
     // instantiated once per scalar type instead of once per (scalar, RNG) pair.
     let mut stream: &mut R = rng;
+    let mut evaluate = evaluate;
+    let mut execution = Compatibility::new(&mut evaluate);
     find_global_pivots_erased(
         state,
-        evaluate,
+        &mut execution,
         nsearch,
         max_nglobal_pivot,
         tol_margin,
         abs_tol,
         &mut stream,
-        None,
     )
 }
 
@@ -179,23 +181,21 @@ where
 ///
 /// Callers inside the crate use this so the search is instantiated once per
 /// scalar type.
-// INVARIANT: the parameter list is the search's boundary (state, evaluator,
-// search limits, tolerance, stream) plus the optional caller context; grouping
-// them into a struct would only move the same values through one more layer.
+// INVARIANT: the parameter list is the search's boundary (state, execution owner,
+// search limits, tolerance, stream); grouping them into a struct would only move
+// the same values through one more layer.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn find_global_pivots_erased<T, F>(
+pub(crate) fn find_global_pivots_erased<T>(
     state: &TreeTCI2<T>,
-    evaluate: F,
+    execution: &mut dyn BatchExecution<T>,
     nsearch: usize,
     max_nglobal_pivot: usize,
     tol_margin: f64,
     abs_tol: f64,
     rng: &mut dyn RngCore,
-    context: Option<&CpuExecutionContext>,
 ) -> TreeTciResult<Vec<MultiIndex>>
 where
     T: FullPivLuScalar + Scalar + tensor4all_core::TensorElement + ScalarParts,
-    F: Fn(GlobalIndexBatch<'_>) -> Result<Vec<T>>,
 {
     let params = SearchParams {
         nsearch,
@@ -203,7 +203,14 @@ where
         tol_margin,
         abs_tol,
     };
-    search_with_readout(state, evaluate, params, rng, cached_walk_readout, context)
+    search_with_readout(
+        state,
+        execution,
+        params,
+        rng,
+        cached_walk_readout,
+        cached_walk_readout_on_session::<T>,
+    )
 }
 
 /// Scalar parameters of one global pivot search, as passed to
@@ -215,6 +222,21 @@ struct SearchParams {
     tol_margin: f64,
     abs_tol: f64,
 }
+
+/// A session-taking approximation readout for runs that own an [`EvalContext`].
+///
+/// It returns typed values, not [`AnyScalar`]s: an `AnyScalar` carries an eager
+/// rank-zero tensor, and publishing one enters the process-global eager
+/// runtime, which is exactly what a caller-held session forbids while it is
+/// active.
+type SessionReadout<T> = fn(
+    &mut TreeTNCachedEvaluator<'_, usize>,
+    &TreeTN<IdxTensor, usize>,
+    &[DynIndex],
+    ColMajorArrayRef<'_, usize>,
+    Option<usize>,
+    &mut tensor4all_tensorbackend::explicit::Session<'_>,
+) -> Result<Vec<T>>;
 
 /// Read one scan through the cache owned by this search. A site hint also
 /// identifies single-candidate scans, whose varied site cannot be inferred.
@@ -231,21 +253,39 @@ fn cached_walk_readout(
         .map_err(anyhow::Error::from)
 }
 
+/// Session counterpart of [`cached_walk_readout`], used when the run owner has a session.
+///
+/// The typed session entry point reads the cached values back as host scalars,
+/// so the readout never constructs an [`AnyScalar`] and never enters the
+/// process-global eager runtime.
+fn cached_walk_readout_on_session<T: tensor4all_core::TensorElement>(
+    evaluator: &mut TreeTNCachedEvaluator<'_, usize>,
+    _treetn: &TreeTN<IdxTensor, usize>,
+    _site_indices: &[DynIndex],
+    candidates: ColMajorArrayRef<'_, usize>,
+    scan_site: Option<usize>,
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+) -> Result<Vec<T>> {
+    let hint = scan_site.map(EvaluationHint::around).unwrap_or_default();
+    evaluator
+        .evaluate_batched_typed_on_session::<T>(session, candidates, hint)
+        .map_err(anyhow::Error::from)
+}
+
 /// [`find_global_pivots`] with the approximation readout supplied by the
 /// caller. Production passes [`cached_walk_readout`]; tests also pass the
 /// pointwise [`TreeTN::evaluate`] to check that the readout does not change
 /// the selected pivots.
-fn search_with_readout<T, F, R>(
+fn search_with_readout<T, R>(
     state: &TreeTCI2<T>,
-    evaluate: F,
+    execution: &mut dyn BatchExecution<T>,
     params: SearchParams,
     rng: &mut dyn RngCore,
     mut readout: R,
-    context: Option<&CpuExecutionContext>,
+    readout_on_session: SessionReadout<T>,
 ) -> TreeTciResult<Vec<MultiIndex>>
 where
     T: FullPivLuScalar + Scalar + tensor4all_core::TensorElement + ScalarParts,
-    F: Fn(GlobalIndexBatch<'_>) -> Result<Vec<T>>,
     R: FnMut(
         &mut TreeTNCachedEvaluator<'_, usize>,
         &TreeTN<IdxTensor, usize>,
@@ -282,7 +322,7 @@ where
     // Materialize the current approximation once per search. A degenerate or
     // inconsistent pivot state is a real error; propagate it rather than
     // silently skipping the search.
-    let treetn = to_treetn_chunked(state, &evaluate, None, EVALUATION_CHUNK_POINTS, context)?;
+    let treetn = to_treetn_chunked(state, execution, None, EVALUATION_CHUNK_POINTS)?;
     let mut site_indices = Vec::with_capacity(n_sites);
     for site in 0..n_sites {
         let node = treetn
@@ -331,7 +371,8 @@ where
                 for point in points {
                     flat.extend_from_slice(point);
                 }
-                let f_values = evaluate(GlobalIndexBatch::new(&flat, n_sites, points.len())?)?;
+                let f_values =
+                    execution.call(GlobalIndexBatch::new(&flat, n_sites, points.len())?)?;
                 if f_values.len() != points.len() {
                     return Err(anyhow::anyhow!(
                         "batch evaluator returned {} values for {} global-pivot candidates",
@@ -343,25 +384,56 @@ where
                 let values = ColMajorArrayRef::new(&flat, &shape).map_err(|error| {
                     anyhow::anyhow!("failed to build candidate index array: {error}")
                 })?;
-                let tt_values = readout(&mut cache, &treetn, &site_indices, values, scan_site)?;
-                if tt_values.len() != points.len() {
-                    return Err(anyhow::anyhow!(
-                        "approximation readout returned {} values for {} global-pivot candidates",
-                        tt_values.len(),
-                        points.len(),
-                    ));
-                }
-                f_values
-                    .into_iter()
-                    .zip(tt_values)
-                    .map(|(f, tt)| {
-                        let error = interp_error(f, tt);
-                        if !error.is_finite() {
-                            return Err(anyhow::anyhow!("non-finite global pivot residual"));
+                let errors: Vec<f64> = match execution.session() {
+                    Some(backend) => {
+                        let mut session =
+                            tensor4all_tensorbackend::explicit::Session::from_backend_session(
+                                backend,
+                            );
+                        let tt_values: Vec<T> = readout_on_session(
+                            &mut cache,
+                            &treetn,
+                            &site_indices,
+                            values,
+                            scan_site,
+                            &mut session,
+                        )?;
+                        if tt_values.len() != points.len() {
+                            return Err(anyhow::anyhow!(
+                                "approximation readout returned {} values for {} global-pivot \
+                                 candidates",
+                                tt_values.len(),
+                                points.len(),
+                            ));
                         }
-                        Ok(error)
-                    })
-                    .collect()
+                        f_values
+                            .into_iter()
+                            .zip(tt_values)
+                            .map(|(f, tt)| typed_interp_error(f, tt))
+                            .collect()
+                    }
+                    None => {
+                        let tt_values =
+                            readout(&mut cache, &treetn, &site_indices, values, scan_site)?;
+                        if tt_values.len() != points.len() {
+                            return Err(anyhow::anyhow!(
+                                "approximation readout returned {} values for {} global-pivot \
+                                 candidates",
+                                tt_values.len(),
+                                points.len(),
+                            ));
+                        }
+                        f_values
+                            .into_iter()
+                            .zip(tt_values)
+                            .map(|(f, tt)| interp_error(f, tt))
+                            .collect()
+                    }
+                };
+                if errors.iter().any(|error| !error.is_finite()) {
+                    return Err(anyhow::anyhow!("non-finite global pivot residual"));
+                }
+                Ok(errors)
             },
         )?;
         if error > threshold {
@@ -439,6 +511,14 @@ impl ScalarParts for num_complex::Complex64 {
 fn interp_error<T: ScalarParts + Copy>(f_value: T, tt_value: AnyScalar) -> f64 {
     let re = f_value.real_part() - tt_value.real();
     let im = f_value.imag_part() - tt_value.imag();
+    (re * re + im * im).sqrt()
+}
+
+/// [`interp_error`] for a typed approximation value, with the same `f64`
+/// arithmetic after each part is widened by [`ScalarParts`].
+fn typed_interp_error<T: ScalarParts + Copy>(f_value: T, tt_value: T) -> f64 {
+    let re = f_value.real_part() - tt_value.real_part();
+    let im = f_value.imag_part() - tt_value.imag_part();
     (re * re + im * im).sqrt()
 }
 

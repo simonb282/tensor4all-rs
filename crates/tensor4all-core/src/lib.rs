@@ -150,8 +150,10 @@ pub use defaults::idx_tensor::{
     print_and_reset_pairwise_contract_profile, reset_pairwise_contract_profile,
 };
 pub use defaults::{
-    contract_pair_on_session, inner_product_on_session, norm_on_session, norm_squared_on_session,
-    permute_indices_on_session, permute_on_session, sum_on_session,
+    contract_pair_on_session, contract_with_options_on_session, index_select_on_session,
+    inner_product_on_session, norm_on_session, norm_squared_on_session, permute_indices_on_session,
+    permute_on_session, select_indices_on_session, stack_along_new_index_on_session,
+    sum_on_session,
 };
 
 // Re-export linear algebra modules from defaults for backwards compatibility
@@ -179,9 +181,12 @@ pub mod svd {
 // Re-export linear algebra items for top-level access
 pub use defaults::direct_sum::direct_sum;
 pub use defaults::factorize::{
-    factorize, factorize_full_rank, factorize_full_rank_in, factorize_in,
+    factorize, factorize_full_rank, factorize_full_rank_in, factorize_full_rank_on_session,
+    factorize_in, factorize_on_session,
 };
-pub use defaults::qr::{default_qr_rtol, qr, qr_with, set_default_qr_rtol, QrError, QrOptions};
+pub use defaults::qr::{
+    default_qr_rtol, qr, qr_with, qr_with_on_session, set_default_qr_rtol, QrError, QrOptions,
+};
 pub use defaults::svd::{
     default_svd_truncation_policy, set_default_svd_truncation_policy, svd, svd_with, SvdError,
     SvdOptions,

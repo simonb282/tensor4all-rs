@@ -2,10 +2,10 @@
 //!
 //! This module works with concrete types (`DynIndex`, `IdxTensor`) only.
 
-use crate::defaults::idx_tensor::unfold_split_inner;
+use crate::defaults::idx_tensor::{unfold_index_sets, unfold_split_inner};
 use crate::defaults::DynIndex;
 use crate::global_default::GlobalDefault;
-use crate::{ExecutionContext, IdxTensor};
+use crate::{ExecutionContext, IdxTensor, TensorElement};
 use num_complex::{Complex64, ComplexFloat};
 use tenferro::DType;
 use tenferro_ad::EagerTensor;
@@ -21,6 +21,15 @@ pub enum QrError {
     /// Invalid relative tolerance value (must be finite and non-negative).
     #[error("Invalid rtol value: {0}. rtol must be finite and non-negative.")]
     InvalidRtol(f64),
+    /// The operand storage cannot enter the runtime-free explicit-session route.
+    ///
+    /// The session routes publish plain host factors, so an AD-tracked operand would lose its graph;
+    /// they refuse it instead.
+    #[error("Unsupported storage type: {0}")]
+    UnsupportedStorage(
+        /// Description of the unsupported operand storage
+        &'static str,
+    ),
 }
 
 /// Options for QR decomposition with truncation control.
@@ -344,7 +353,7 @@ pub fn qr_with<T>(
 /// use tensor4all_core::qr::{QrOptions, qr_with_in};
 /// use tensor4all_core::{DynIndex, ExecutionContext, IdxTensor, TensorContractionLike};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = ExecutionContext::Cpu(Arc::new(
 ///     CpuExecutionContext::from_backend(CpuBackend::new()),
@@ -407,11 +416,8 @@ fn qr_retained_rows(
     if !options.truncate {
         return Ok((0..k).collect());
     }
-    // Determine rtol to use
+    // Determine rtol to use; validity is checked by the shared policy body.
     let rtol = options.rtol.unwrap_or(default_qr_rtol());
-    if !rtol.is_finite() || rtol < 0.0 {
-        return Err(QrError::InvalidRtol(rtol));
-    }
 
     #[cfg(feature = "tenferro-cuda")]
     if let Some(context) = context {
@@ -431,18 +437,177 @@ fn qr_retained_rows(
             let values = value
                 .as_slice::<f64>()
                 .map_err(|source| QrError::ComputationError(anyhow::Error::new(source)))?;
-            compute_retained_rows_qr_from_dense(values, k, n, rtol)
+            retain_rows_from_payload(values, k, n, rtol)
         }
         DType::C64 => {
             let values = value
                 .as_slice::<Complex64>()
                 .map_err(|source| QrError::ComputationError(anyhow::Error::new(source)))?;
-            compute_retained_rows_qr_from_dense(values, k, n, rtol)
+            retain_rows_from_payload(values, k, n, rtol)
         }
         other => Err(QrError::ComputationError(anyhow::anyhow!(
             "native QR returned unsupported scalar type {other:?}"
         ))),
     }
+}
+
+/// The retained-row decision on a host `R` payload.
+///
+/// This is the one place the QR truncation policy is applied; the eager, context-scoped and
+/// explicit-session QR routes all funnel their `R` payload through it, so a policy change cannot
+/// diverge between the frontends.
+fn retain_rows_from_payload<T>(
+    r_full: &[T],
+    k: usize,
+    n: usize,
+    rtol: f64,
+) -> Result<Vec<usize>, QrError>
+where
+    T: ComplexFloat,
+    <T as ComplexFloat>::Real: Into<f64>,
+{
+    if !options_rtol_is_valid(rtol) {
+        return Err(QrError::InvalidRtol(rtol));
+    }
+    compute_retained_rows_qr_from_dense(r_full, k, n, rtol)
+}
+
+/// `rtol` validity shared by every QR route.
+fn options_rtol_is_valid(rtol: f64) -> bool {
+    rtol.is_finite() && rtol >= 0.0
+}
+
+/// Truncated QR on a caller-held explicit session.
+///
+/// The runtime-free counterpart of [`qr_with`]: the index bookkeeping, the retained-row decision and
+/// the factor assembly are the same code paths, while the decomposition runs on `session` and the
+/// factors are published as plain host-storage [`IdxTensor`]s. Nothing here enters a session or the
+/// eager runtime, so this is the route a scheduler-owned lane uses.
+///
+/// # Errors
+///
+/// Returns [`QrError`] when the split is invalid, when `options.rtol` is not finite and nonnegative,
+/// when the operand is AD-tracked ([`QrError::UnsupportedStorage`] - this route publishes plain host
+/// factors and would silently sever the graph), when the session rejects the decomposition, or when a
+/// factor cannot be published.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_core::{qr::QrOptions, DynIndex, IdxTensor};
+/// use tensor4all_core::qr_with_on_session;
+/// use tensor4all_tensorbackend::{explicit::{HeldSession, Session}, CpuExecutionContext};
+/// use tensor4all_tensorbackend::CpuBackend;
+///
+/// let i = DynIndex::new_dyn(4);
+/// let j = DynIndex::new_dyn(3);
+/// let data: Vec<f64> = (0..12).map(|x| x as f64).collect();
+/// let tensor = IdxTensor::from_dense(vec![i.clone(), j.clone()], data)?;
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let backend: CpuBackend = context.with_backend(|backend| backend.clone());
+/// let mut held = HeldSession::open(&backend)?;
+/// let (q, r) = held.with_session(|view| {
+///     let mut session = Session::from_backend_session(view.backend());
+///     qr_with_on_session::<f64>(&mut session, &tensor, std::slice::from_ref(&i), &QrOptions::new())
+/// })?;
+/// held.close()?;
+/// assert_eq!(q.dims()[0], 4);
+/// assert_eq!(r.dims()[1], 3);
+/// assert_eq!(q.dims()[1], r.dims()[0], "the shared bond dimension");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn qr_with_on_session<T>(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+    options: &QrOptions,
+) -> Result<(IdxTensor, IdxTensor), QrError>
+where
+    T: TensorElement + ComplexFloat + tensor4all_tensorbackend::StorageScalar,
+    <T as ComplexFloat>::Real: Into<f64>,
+{
+    if t.tracks_grad() {
+        return Err(QrError::UnsupportedStorage(
+            crate::defaults::idx_tensor::TRACKED_SESSION_OPERAND_REFUSAL,
+        ));
+    }
+    let (left_indices, right_indices, order) =
+        unfold_index_sets(t, left_inds).map_err(|error| {
+            QrError::ComputationError(anyhow::anyhow!("Failed to unfold tensor: {error}"))
+        })?;
+    // Read and reorder the operand's own host payload: entering the eager
+    // runtime for a transpose would be a second session entry on this thread.
+    let (dims, data) = t
+        .host_dense_permuted::<T>(&order)
+        .map_err(|error| QrError::ComputationError(anyhow::Error::new(error)))?;
+    let left_len = left_indices.len();
+    let m = crate::defaults::idx_tensor::checked_product(&dims[..left_len])
+        .map_err(QrError::ComputationError)?;
+    let n = crate::defaults::idx_tensor::checked_product(&dims[left_len..])
+        .map_err(QrError::ComputationError)?;
+    let k = m.min(n);
+    let matrix = tenferro::Tensor::from_vec_col_major(vec![m, n], data)
+        .map_err(|error| QrError::ComputationError(anyhow::Error::new(error)))?;
+    let (q_value, r_value) = session
+        .qr(&matrix)
+        .map_err(|error| QrError::ComputationError(anyhow::anyhow!("{error}")))?;
+    let keep = if options.truncate {
+        let r_payload = r_value
+            .as_slice::<T>()
+            .map_err(|error| QrError::ComputationError(anyhow::Error::new(error)))?;
+        let rtol = options.rtol.unwrap_or(default_qr_rtol());
+        retain_rows_from_payload(r_payload, k, n, rtol)?
+    } else {
+        (0..k).collect()
+    };
+    let rank = keep.len();
+    let q_payload = q_value
+        .as_slice::<T>()
+        .map_err(|error| QrError::ComputationError(anyhow::Error::new(error)))?;
+    let r_payload = r_value
+        .as_slice::<T>()
+        .map_err(|error| QrError::ComputationError(anyhow::Error::new(error)))?;
+    let bond_index = DynIndex::new_bond(rank).map_err(|error| {
+        QrError::ComputationError(anyhow::anyhow!("Failed to create Link index: {error:?}"))
+    })?;
+
+    // `Q` is column-major `[m, k]`: kept columns are the bond axis of the left factor.
+    let mut q_data = Vec::with_capacity(m * rank);
+    for &column in &keep {
+        let start = column.checked_mul(m).ok_or_else(|| {
+            QrError::ComputationError(anyhow::anyhow!("QR Q column offset overflows usize"))
+        })?;
+        let end = start.checked_add(m).ok_or_else(|| {
+            QrError::ComputationError(anyhow::anyhow!("QR Q column end overflows usize"))
+        })?;
+        q_data.extend_from_slice(q_payload.get(start..end).ok_or_else(|| {
+            QrError::ComputationError(anyhow::anyhow!("QR Q column {column} is out of bounds"))
+        })?);
+    }
+    // `R` is column-major `[k, n]`: kept rows are gathered within every right column.
+    let mut r_data = Vec::with_capacity(rank * n);
+    for column in 0..n {
+        let base = column.checked_mul(k).ok_or_else(|| {
+            QrError::ComputationError(anyhow::anyhow!("QR R column offset overflows usize"))
+        })?;
+        for &row in &keep {
+            let value = r_payload.get(base + row).ok_or_else(|| {
+                QrError::ComputationError(anyhow::anyhow!("QR R row {row} is out of bounds"))
+            })?;
+            r_data.push(*value);
+        }
+    }
+
+    let mut q_indices = left_indices;
+    q_indices.push(bond_index.clone());
+    let mut r_indices = vec![bond_index];
+    r_indices.extend(right_indices);
+    let q = IdxTensor::from_host_dense(q_indices, q_data)
+        .map_err(|error| QrError::ComputationError(anyhow::Error::new(error)))?;
+    let r = IdxTensor::from_host_dense(r_indices, r_data)
+        .map_err(|error| QrError::ComputationError(anyhow::Error::new(error)))?;
+    Ok((q, r))
 }
 
 /// Slice the thin factors to the retained rows of `R` (and the matching columns

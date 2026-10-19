@@ -16,6 +16,34 @@ implementing `tensor4all_treetn::interpolation::TreeInterpolator` (for example
 fixes the next site of `patch_order` and retries on every child. The crate
 depends on the engine trait only, not on `tensor4all-treetci`.
 
+The run takes the caller's `EvalContext` (a session the caller has already
+entered, together with the caller's parallelism budget), and the evaluator
+receives that same context. Every numerical stage - the engine call, the
+re-embedding of fixed sites, the measurement of a stored patch, and the norm
+readout - runs on that session, so a run completes inside a caller-held
+session such as a scheduler lane and needs no process-global warm-up. The
+returned partition and report are published as compact host storage and stay
+usable after the session closes.
+
+### Entries
+
+Three entries run the same driver: one wave loop over the BFS generations of
+the patch queue. A wave is dispatched, merged in canonical path order, and its
+splits form the next one.
+
+| Entry | Where a patch runs | Evaluator |
+|---|---|---|
+| `patched_interpolate` | the caller's `EvalContext`, one patch after another | `FnMut` |
+| `patched_interpolate_on_lanes` | the child session of the `hataori_tenferro::TenferroLanes` lane that pulled it; the root wave and waves smaller than the lane count run one patch at a time | `Fn + Sync` |
+| `patched_interpolate_mpi` (features `hataori-mpi` / `hataori-mpi-rsmpi-rt`) | the lane of the rank that `hataori::pmap_lanes` assigns the patch to; the root orchestrates waves and owns the result | `Fn + Sync` |
+
+The schedule never changes the result contract: random sub-seeds come from the
+seed and the patch path, counters are per patch and summed, references are
+pinned while the single root patch runs, and `max_patches` is checked before a
+wave is dispatched. A lanes run reproduces the serial report at one and two
+lanes on the fixtures of `tests/adaptive_lanes.rs`; the rounding caveat of the
+generic cached-evaluator path is unchanged.
+
 The accuracy requirement is `PatchedInterpolationOptions::error_norm` with
 `tolerance: ErrorTolerance { rtol, atol }`:
 
@@ -103,8 +131,8 @@ limitation: corner-localized misses" in
   evaluation retains the distinct planner limitation above.
 
 The patch queue and pivot recycling derive from TCIAlgorithms.jl (MIT) through
-the deprecated `tensor4all-partitionedtt`; this crate carries
-`LICENSE-TCIALGORITHMS-MIT`.
+the chain driver of the retired `tensor4all-partitionedtt` crate (removed in
+#915 D3, settling #825); this crate carries `LICENSE-TCIALGORITHMS-MIT`.
 
 ## Truncation convention
 
@@ -254,6 +282,6 @@ requires an explicit existing TreeTN node name as its center.
 - [Migration design](../../docs/design/partitioned-treetn.md)
 - [Provenance and citation policy](../../docs/PROVENANCE_AND_CITATION_POLICY.md)
 
-The deprecated `tensor4all-partitionedtt` crate remains buildable during the
-migration window. It is limited to correctness and security fixes; no removal
-date has been set.
+The `tensor4all-partitionedtt` crate this one replaced was removed in #915 D3
+(settling #825); the [Partitioned TreeTN guide](https://tensor4all.org/tensor4all-rs/guides/partitioned-treetn.html)
+maps its entry points onto this crate's.

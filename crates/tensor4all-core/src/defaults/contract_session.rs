@@ -4,6 +4,7 @@ use tenferro::{Tensor as NativeTensor, TensorScalar};
 
 use crate::defaults::contract::PairwiseContractionOptions;
 use crate::defaults::idx_tensor::{IdxTensor, IdxTensorError, SessionDenseOperand};
+use crate::index_like::IndexLike;
 use crate::index_ops::prepare_contraction;
 
 /// Operation name the refusals and errors of this entry point carry.
@@ -28,12 +29,12 @@ const OP: &str = "contract_pair_on_session";
 ///
 /// # Errors
 ///
-/// Returns a typed [`IdxTensorError`] for an operand whose representation or dtype this slice does not
-/// serve - a tracked value, a device-resident operand, a diagonal, structured or compact payload, or an
-/// `f32`/`c32` or non-floating dtype, because this route's scalar carrier is a rank-zero `IdxTensor` whose
-/// compact storage holds only `f64` and `c64` - for an operand whose index list repeats an index, for incompatible
+/// Returns a typed [`IdxTensorError`] for an operand whose representation this slice does not serve - an
+/// AD-tracked value, a device-resident operand, or a diagonal, structured or compact payload - for a
+/// non-floating dtype, for an operand whose index list repeats an index, for incompatible
 /// index spaces (the planner's shape and dimension errors), when the session rejects the contraction, or
-/// when the result cannot be published. A deferred storage error is returned as
+/// when the result cannot be published. Every floating dtype (`f32`, `f64`, `c32`, `c64`) is served and the
+/// result keeps the session's dtype. A deferred storage error is returned as
 /// [`IdxTensorError::Storage`] with its original source.
 ///
 /// # Examples
@@ -42,7 +43,7 @@ const OP: &str = "contract_pair_on_session";
 /// use tensor4all_core::index::{DefaultIndex as Index, DynId};
 /// use tensor4all_core::{contract_pair_on_session, IdxTensor, PairwiseContractionOptions};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let i = Index::new_dyn(2);
@@ -136,7 +137,7 @@ pub fn contract_pair_on_session(
 /// use tensor4all_core::index::{DefaultIndex as Index, DynId};
 /// use tensor4all_core::{inner_product_on_session, IdxTensor};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let i = Index::new_dyn(2);
@@ -230,6 +231,14 @@ pub fn inner_product_on_session(
             let value = first_scalar::<f64>(&product)?;
             crate::AnyScalar::from_published(value, published)
         }
+        tenferro::DType::F32 => {
+            let value = first_scalar::<f32>(&product)?;
+            crate::AnyScalar::from_published(value, published)
+        }
+        tenferro::DType::C32 => {
+            let value = first_scalar::<num_complex::Complex32>(&product)?;
+            crate::AnyScalar::from_published(value, published)
+        }
         tenferro::DType::C64 => {
             let value = first_scalar::<num_complex::Complex64>(&product)?;
             crate::AnyScalar::from_published(value, published)
@@ -238,7 +247,7 @@ pub fn inner_product_on_session(
             return Err(IdxTensorError::operation(
                 OP,
                 anyhow::anyhow!(
-                    "the explicit-session route returns f64 and c64 scalars, not {other:?}"
+                    "the explicit-session route returns floating-point scalars, not {other:?}"
                 ),
             ));
         }
@@ -316,7 +325,7 @@ const SUM_OP: &str = "sum_on_session";
 /// use tensor4all_core::index::{DefaultIndex as Index, DynId};
 /// use tensor4all_core::{sum_on_session, IdxTensor};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let i = Index::new_dyn(2);
@@ -333,8 +342,8 @@ pub fn sum_on_session(
     tensor: &IdxTensor,
 ) -> Result<crate::AnyScalar, IdxTensorError> {
     // The operand is adapted - and therefore refused - before any session work, as in the other slices. The
-    // scalar's carrier here is a rank-zero `IdxTensor`, whose compact storage holds `f64` and `c64`, so this
-    // route keeps the narrow policy even though its result is a scalar.
+    // result is published as a rank-zero `IdxTensor` whose compact storage keeps the reduced dtype, so a
+    // narrow `f32`/`c32` operand yields a narrow scalar rather than a widened one.
     let operand = tensor.session_dense_operand(SUM_OP)?;
     let value = materialize_on_session(SUM_OP, session, operand)?;
     // `Session::sum` reduces every axis and duplicates an already rank-zero value, so one call covers both.
@@ -346,6 +355,13 @@ pub fn sum_on_session(
         tenferro::DType::F64 => {
             crate::AnyScalar::from_published(first_scalar::<f64>(&reduced)?, published)
         }
+        tenferro::DType::F32 => {
+            crate::AnyScalar::from_published(first_scalar::<f32>(&reduced)?, published)
+        }
+        tenferro::DType::C32 => crate::AnyScalar::from_published(
+            first_scalar::<num_complex::Complex32>(&reduced)?,
+            published,
+        ),
         tenferro::DType::C64 => crate::AnyScalar::from_published(
             first_scalar::<num_complex::Complex64>(&reduced)?,
             published,
@@ -354,7 +370,7 @@ pub fn sum_on_session(
             return Err(IdxTensorError::operation(
                 SUM_OP,
                 anyhow::anyhow!(
-                    "the explicit-session route reduces the dtypes this seam serves, not {other:?}"
+                    "the explicit-session route reduces floating-point dtypes, not {other:?}"
                 ),
             ));
         }
@@ -375,14 +391,14 @@ pub fn sum_on_session(
 ///
 /// Returns a typed [`IdxTensorError`] for a permutation whose length does not match the rank, an axis out of
 /// range or repeated - with the shared validator's messages - and, **for a nonidentity permutation**, under
-/// the same conditions as [`contract_pair_on_session`] refuses an operand: a tracked value, a
-/// device-resident operand, a diagonal, structured or compact payload, a deferred storage error, or an
-/// `f32`/`c32` or non-floating dtype. It also returns one when the session rejects the permutation or the
+/// the same conditions as [`contract_pair_on_session`] refuses an operand: an AD-tracked value, a
+/// device-resident operand, a diagonal, structured or compact payload, a deferred storage error, or a
+/// non-floating dtype. It also returns one when the session rejects the permutation or the
 /// result cannot be published.
 ///
 /// **An identity permutation never reaches those refusals**: like the compatibility route it returns the
 /// tensor unchanged, whatever its representation or dtype, because it is metadata only. Execution - and
-/// therefore the `f64`/`c64` domain of this seam - applies to the nonidentity case.
+/// therefore the floating-dtype domain of this seam - applies to the nonidentity case.
 ///
 /// # Examples
 ///
@@ -390,7 +406,7 @@ pub fn sum_on_session(
 /// use tensor4all_core::index::{DefaultIndex as Index, DynId};
 /// use tensor4all_core::{permute_on_session, IdxTensor};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let i = Index::new_dyn(2);
@@ -448,7 +464,7 @@ pub fn permute_on_session(
 /// before a contraction. The index list must be a permutation of the tensor's own indices by full index
 /// equality, exactly as the compatibility route requires; the permutation is derived with the same helper,
 /// so the two routes refuse the same inputs with the same messages. Execution is
-/// [`permute_on_session`]'s, so this route serves the same dense `f64`/`c64` domain, and an identity
+/// [`permute_on_session`]'s, so this route serves the same dense floating-dtype domain, and an identity
 /// permutation is metadata only - it returns the same storage under the supplied index list, for any
 /// representation, without touching the session.
 ///
@@ -468,7 +484,7 @@ pub fn permute_on_session(
 /// use tensor4all_core::index::{DefaultIndex as Index, DynId};
 /// use tensor4all_core::{permute_indices_on_session, IdxTensor};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let i = Index::new_dyn(2);
@@ -548,8 +564,7 @@ pub fn permute_indices_on_session(
 /// host-read failure while the operand is brought onto the caller's session.
 ///
 /// **`f32` and `c32` operands are served here**, because this route returns a scalar: they are promoted into
-/// the same `f64` accumulation the compatibility route uses for them. A route whose result is a dense tensor
-/// cannot serve them, because this crate's compact storage holds only `f64` and `c64`.
+/// the same `f64` accumulation the compatibility route uses for them.
 ///
 /// # Examples
 ///
@@ -557,7 +572,7 @@ pub fn permute_indices_on_session(
 /// use tensor4all_core::index::{DefaultIndex as Index, DynId};
 /// use tensor4all_core::{norm_squared_on_session, IdxTensor};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let i = Index::new_dyn(2);
@@ -574,10 +589,7 @@ pub fn norm_squared_on_session(
     tensor: &IdxTensor,
 ) -> Result<f64, IdxTensorError> {
     const OP: &str = "norm_squared_on_session";
-    let operand = tensor.session_dense_operand_with(
-        crate::defaults::idx_tensor::SessionDtypePolicy::AnyFloating,
-        OP,
-    )?;
+    let operand = tensor.session_dense_operand(OP)?;
     let value = materialize_on_session(OP, session, operand)?;
     let squared =
         match value.dtype() {
@@ -652,7 +664,7 @@ pub fn norm_squared_on_session(
 /// use tensor4all_core::index::{DefaultIndex as Index, DynId};
 /// use tensor4all_core::{norm_on_session, IdxTensor};
 /// use tensor4all_tensorbackend::CpuExecutionContext;
-/// use tenferro_cpu::CpuBackend;
+/// use tensor4all_tensorbackend::CpuBackend;
 ///
 /// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
 /// let i = Index::new_dyn(2);
@@ -667,6 +679,269 @@ pub fn norm_on_session(
     tensor: &IdxTensor,
 ) -> Result<f64, IdxTensorError> {
     Ok(norm_squared_on_session(session, tensor)?.sqrt())
+}
+
+/// Publish a compact host copy of one operand on the caller's session.
+///
+/// The copy is the representation boundary the runtime-free indexed operations
+/// use: once an operand is compact, selection, stacking, gathering and
+/// permutation move host values without entering any runtime.
+fn compact_on_session(
+    op: &'static str,
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    tensor: &IdxTensor,
+) -> Result<IdxTensor, IdxTensorError> {
+    let operand = tensor.session_dense_operand(op)?;
+    let value = materialize_on_session(op, session, operand)?;
+    IdxTensor::publish_dense_session_result(tensor.indices().to_vec(), &value)
+}
+
+/// Contract a connected tensor network on a caller-held explicit session.
+///
+/// The runtime-free counterpart of [`contract_with_options`](crate::contract_with_options)
+/// for the concrete (non-AD) frontend: validation, connectivity, retained-index
+/// handling and the output index order come from the compatibility route's own
+/// planner, while the numerical contraction runs on `session` and the result is
+/// published as compact host storage. `f32`, `f64`, `c32` and `c64` operands are
+/// served, and the result keeps the session's dtype.
+///
+/// An empty input, an unreachable retained index, a disconnected network, a
+/// tracked or device-resident operand, or a structured/diagonal payload is
+/// refused with a typed [`IdxTensorError`].
+///
+/// # Errors
+///
+/// Returns [`IdxTensorError::Operation`] when the input is empty, when a
+/// retained index does not appear in any operand, when the operands form
+/// disconnected components, when an operand is tracked, device-resident, or a
+/// compact structured/diagonal payload, when the session rejects a
+/// materialization or the contraction, or when the result cannot be published.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_core::{contract_with_options_on_session, ContractionOptions, DynIndex, IdxTensor};
+/// use tensor4all_tensorbackend::CpuExecutionContext;
+/// use tensor4all_tensorbackend::CpuBackend;
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let i = DynIndex::new_dyn(2);
+/// let j = DynIndex::new_dyn(2);
+/// let batch = DynIndex::new_dyn(2);
+/// let left = IdxTensor::from_dense(
+///     vec![i.clone(), batch.clone()],
+///     vec![1.0_f64, 2.0, 3.0, 4.0],
+/// )?;
+/// let right = IdxTensor::from_dense(
+///     vec![i, j.clone()],
+///     vec![1.0_f64, 0.0, 0.0, 1.0],
+/// )?;
+/// let result = context.with_concrete_session(|session| {
+///     contract_with_options_on_session(
+///         session,
+///         &[&left, &right],
+///         ContractionOptions::new().with_retain_indices(&[batch.clone()]),
+///     )
+/// })??;
+/// assert_eq!(result.indices(), &[batch, j]);
+/// // Column-major over `[batch, j]`: each `j` column holds the two batch values.
+/// assert_eq!(result.dense_host_values::<f64>()?, vec![1.0, 3.0, 2.0, 4.0]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn contract_with_options_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    tensors: &[&IdxTensor],
+    options: crate::defaults::contract::ContractionOptions<'_>,
+) -> Result<IdxTensor, IdxTensorError> {
+    const OP: &str = "contract_with_options_on_session";
+    let Some(plan) = crate::defaults::contract::session_contraction_plan(tensors, options)
+        .map_err(|error| anyhow_error(OP, error))?
+    else {
+        let tensor = tensors.first().ok_or_else(|| {
+            IdxTensorError::operation(OP, anyhow::anyhow!("No tensors to contract"))
+        })?;
+        return Ok((*tensor).clone());
+    };
+
+    // Adapt every operand before any session work, so a refusal on a later
+    // operand cannot follow numerical work on an earlier one.
+    let operands = tensors
+        .iter()
+        .map(|tensor| tensor.session_dense_operand(OP))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = operands
+        .into_iter()
+        .map(|operand| materialize_on_session(OP, session, operand))
+        .collect::<Result<Vec<_>, _>>()?;
+    let value_refs = values.iter().collect::<Vec<_>>();
+    let input_ids = plan.input_ids.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let contracted = session
+        .einsum(&value_refs, &input_ids, &plan.output_ids)
+        .map_err(|error| session_error(OP, error))?;
+    IdxTensor::publish_dense_session_result(plan.result_indices, &contracted)
+}
+
+/// Select fixed coordinates of a dense host tensor on a caller-held explicit session.
+///
+/// The session counterpart of [`IdxTensor::select_indices`]: the operand is
+/// published as compact host storage on `session` and the selection is the
+/// runtime-free host movement the compact route already uses. All four floating
+/// dtypes are served, and the result is compact host storage.
+///
+/// # Errors
+///
+/// Returns a typed [`IdxTensorError`] for the same malformed selections as the
+/// compatibility route and for the representation/dtype refusals the session
+/// admission applies (a tracked or device-resident operand, a structured or
+/// diagonal payload, or a non-floating dtype).
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_core::{select_indices_on_session, DynIndex, IdxTensor};
+/// use tensor4all_tensorbackend::CpuExecutionContext;
+/// use tensor4all_tensorbackend::CpuBackend;
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let i = DynIndex::new_dyn(2);
+/// let j = DynIndex::new_dyn(3);
+/// let tensor = IdxTensor::from_dense(
+///     vec![i, j.clone()],
+///     vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],
+/// )?;
+/// let selected = context.with_concrete_session(|session| {
+///     select_indices_on_session(session, &tensor, std::slice::from_ref(&j), &[1])
+/// })??;
+/// assert_eq!(selected.dense_host_values::<f64>()?, vec![3.0, 4.0]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn select_indices_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    tensor: &IdxTensor,
+    selected_indices: &[crate::defaults::DynIndex],
+    positions: &[usize],
+) -> Result<IdxTensor, IdxTensorError> {
+    const OP: &str = "select_indices_on_session";
+    let compact = compact_on_session(OP, session, tensor)?;
+    compact.select_indices(selected_indices, positions)
+}
+
+/// Stack dense host tensors along a newly inserted index on a caller-held explicit session.
+///
+/// The session counterpart of [`IdxTensor::stack_along_new_index`]: every operand
+/// is published as compact host storage on `session`, then the runtime-free host
+/// stacking route concatenates them. All four floating dtypes are served.
+///
+/// # Errors
+///
+/// Returns a typed [`IdxTensorError`] for the same malformed inputs as the
+/// compatibility route (no tensors, a mismatched new-index dimension, differing
+/// index orders or dimensions, an invalid insertion axis) and for the
+/// representation/dtype refusals the session admission applies.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_core::{stack_along_new_index_on_session, DynIndex, IdxTensor};
+/// use tensor4all_tensorbackend::CpuExecutionContext;
+/// use tensor4all_tensorbackend::CpuBackend;
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let i = DynIndex::new_dyn(2);
+/// let batch = DynIndex::new_dyn(2);
+/// let left = IdxTensor::from_dense(vec![i.clone()], vec![1.0_f64, 2.0])?;
+/// let right = IdxTensor::from_dense(vec![i], vec![3.0_f64, 4.0])?;
+/// let stacked = context.with_concrete_session(|session| {
+///     stack_along_new_index_on_session(session, &[&left, &right], batch, -1)
+/// })??;
+/// assert_eq!(stacked.dense_host_values::<f64>()?, vec![1.0, 2.0, 3.0, 4.0]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn stack_along_new_index_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    tensors: &[&IdxTensor],
+    new_index: crate::defaults::DynIndex,
+    axis: isize,
+) -> Result<IdxTensor, IdxTensorError> {
+    const OP: &str = "stack_along_new_index_on_session";
+    let compact = tensors
+        .iter()
+        .map(|tensor| compact_on_session(OP, session, tensor))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs = compact.iter().collect::<Vec<_>>();
+    IdxTensor::stack_along_new_index(&refs, new_index, axis)
+}
+
+/// Gather positions along one index on a caller-held explicit session.
+///
+/// The session counterpart of [`IdxTensor::index_select`]: the operand is
+/// published as compact host storage on `session` and the gather runs on that
+/// host payload, so it enters no runtime. All four floating dtypes are served.
+///
+/// # Errors
+///
+/// Returns a typed [`IdxTensorError`] when the target dimension does not match
+/// the position count, the source index is absent, a position is out of range,
+/// or the session admission refuses the operand.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_core::{index_select_on_session, DynIndex, IdxTensor};
+/// use tensor4all_tensorbackend::CpuExecutionContext;
+/// use tensor4all_tensorbackend::CpuBackend;
+///
+/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+/// let source = DynIndex::new_dyn(3);
+/// let target = DynIndex::new_dyn(2);
+/// let tensor = IdxTensor::from_dense(vec![source.clone()], vec![10.0_f64, 20.0, 30.0])?;
+/// let gathered = context.with_concrete_session(|session| {
+///     index_select_on_session(session, &tensor, &source, target, &[2, 0])
+/// })??;
+/// assert_eq!(gathered.dense_host_values::<f64>()?, vec![30.0, 10.0]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn index_select_on_session(
+    session: &mut tensor4all_tensorbackend::explicit::Session<'_>,
+    tensor: &IdxTensor,
+    source_index: &crate::defaults::DynIndex,
+    target_index: crate::defaults::DynIndex,
+    positions: &[usize],
+) -> Result<IdxTensor, IdxTensorError> {
+    const OP: &str = "index_select_on_session";
+    if target_index.dim() != positions.len() {
+        return Err(IdxTensorError::operation(
+            OP,
+            anyhow::anyhow!(
+                "index_select: target index dim {} does not match position count {}",
+                target_index.dim(),
+                positions.len()
+            ),
+        ));
+    }
+    let axis = tensor
+        .indices()
+        .iter()
+        .position(|index| index == source_index)
+        .ok_or_else(|| {
+            IdxTensorError::operation(
+                OP,
+                anyhow::anyhow!("index_select: source index is not present"),
+            )
+        })?;
+    let source_dim = tensor.indices()[axis].dim();
+    for &position in positions {
+        if position >= source_dim {
+            return Err(IdxTensorError::operation(
+                OP,
+                anyhow::anyhow!(
+                    "index_select: position {position} is out of range for source dim {source_dim}"
+                ),
+            ));
+        }
+    }
+    let compact = compact_on_session(OP, session, tensor)?;
+    compact.gather_dense_host(axis, positions, target_index)
 }
 
 /// Materialize one operand as an owned concrete host value of the caller's session.

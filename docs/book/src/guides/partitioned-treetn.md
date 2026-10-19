@@ -1,9 +1,8 @@
 # Partitioned TreeTNs
 
 `tensor4all-partitionedtreetn` stores TreeTN subdomains as eagerly masked
-patches. It is the TreeTN-native successor to the deprecated
-`tensor4all-partitionedtt` crate and supports named chains, branched trees, and
-multiple site indices on one node.
+patches. It replaces the retired `tensor4all-partitionedtt` crate and supports
+named chains, branched trees, and multiple site indices on one node.
 
 This crate provides partition algebra, TreeTN-general adaptive patching, and
 adaptive patched interpolation of a function through any tree interpolation
@@ -118,10 +117,30 @@ and every child is interpolated in turn. For quantics grids, list the most
 significant bits first.
 
 The evaluator receives a column-major `[n_sites, n_points]` batch of
-zero-based full-domain points in the derived site order: nodes in ascending
-name order, each node's sites in the given order. Each patch caches its
+zero-based full-domain points in the derived site order (nodes in ascending
+name order, each node's sites in the given order) and the run's
+`EvalContext`. Every numerical stage of the run - the engine, re-embedding,
+measurement, and the norm readout - uses that context's session; nothing
+enters the process-global session, so a run completes inside a caller-held
+session (for example a scheduler lane) and needs no process-global warm-up.
+The returned partition and report are published as compact host storage and
+stay usable after the session closes. Each patch caches its
 samples and hands them to its children, so no point is evaluated twice, and a
 patch with at most one unfixed site is evaluated exactly without the engine.
+
+The driver has three entries that share one wave loop over the BFS
+generations of the patch queue. `patched_interpolate` runs every patch on the
+caller's session, one after another.
+`adaptive_interpolation::patched_interpolate_on_lanes` fans each wave out over
+the lanes of a caller-owned `hataori_tenferro::TenferroLanes`, so every patch
+runs in the child session of the lane that pulled it; the root wave and waves
+smaller than the lane count run one patch at a time, so a single item keeps
+the backend's whole team.
+`adaptive_interpolation::patched_interpolate_mpi` (feature `hataori-mpi` or
+`hataori-mpi-rsmpi-rt`) distributes each wave over MPI ranks through
+`hataori::pmap_lanes`, with the root owning the queue and the result. The
+schedule does not change the report: seeds come from the seed and the patch
+path, counters are per patch, and the wave merge is in canonical path order.
 
 The accuracy requirement is an `ErrorNorm` with an
 `ErrorTolerance { rtol, atol }`. The default, `ErrorNorm::L2`, bounds the L2
@@ -136,8 +155,11 @@ measures every accepted and zero patch itself.
 #     patched_interpolate, GlobalL2Error, PatchedInterpolationOptions,
 # };
 # use tensor4all_partitionedtreetn::{ErrorNorm, ErrorTolerance, L2Reference};
+# use tensor4all_tensorbackend::{explicit::{HeldSession, Session}, CpuExecutionContext};
 # use tensor4all_treetci::TreeTciInterpolator;
+# use tensor4all_treetn::interpolation::{EvalContext, Parallelism};
 # use tensor4all_treetn::NodeNameNetwork;
+# use tensor4all_tensorbackend::CpuBackend;
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 // A junction "c" of degree three without a site, and three leaves.
 let (x, y, z) = (DynIndex::new_dyn(2), DynIndex::new_dyn(3), DynIndex::new_dyn(3));
@@ -163,16 +185,29 @@ let options = PatchedInterpolationOptions::new(3)
     .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
     .with_tolerance(ErrorTolerance { rtol: 1e-10, atol: 0.0 })
     .with_patch_order(vec![x.clone(), y.clone()]);
-let result = patched_interpolate(
-    &TreeTciInterpolator::default(),
-    topology,
-    node_sites,
-    ColMajorArray::new(vec![1, 2, 2], vec![3, 1])?,
-    |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
-        Ok(batch.data().chunks(3).map(f).collect())
-    },
-    &options,
-)?;
+let result = {
+    let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+    let backend: CpuBackend = context.with_backend(|backend| backend.clone());
+    let mut held = HeldSession::open(&backend)?;
+    let outcome = held.with_session(|view| {
+        patched_interpolate(
+            &TreeTciInterpolator::default(),
+            topology,
+            node_sites,
+            ColMajorArray::new(vec![1, 2, 2], vec![3, 1]).expect("2D pivots"),
+            &mut EvalContext::new(
+                Session::from_backend_session(view.backend()),
+                Parallelism::Serial,
+            ),
+            |batch: ColMajorArrayRef<'_, usize>,
+             _ctx: &mut EvalContext<'_>|
+             -> anyhow::Result<Vec<f64>> { Ok(batch.data().chunks(3).map(f).collect()) },
+            &options,
+        )
+    });
+    held.close()?;
+    outcome?
+};
 
 // The x = 0 half is a measured zero patch; the rest is split at y.
 assert_eq!(result.report.zero_patches.len(), 1);
@@ -253,8 +288,11 @@ capped acceptance exhaustively measured.
 #     ToleranceNotMetBasis,
 # };
 # use tensor4all_partitionedtreetn::{ErrorNorm, ErrorTolerance, L2Reference};
+# use tensor4all_tensorbackend::{explicit::{HeldSession, Session}, CpuExecutionContext};
 # use tensor4all_treetci::TreeTciInterpolator;
+# use tensor4all_treetn::interpolation::{EvalContext, Parallelism};
 # use tensor4all_treetn::NodeNameNetwork;
+# use tensor4all_tensorbackend::CpuBackend;
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 // f(x, y) = 1 + [x == y] on two sites of dimension 3 has rank three, which
 // a cap of two cannot represent. A minimum of two bits retains the root.
@@ -271,16 +309,29 @@ let options = PatchedInterpolationOptions::new(2)
     .with_error_norm(ErrorNorm::l2(L2Reference::Given(norm)))
     .with_tolerance(ErrorTolerance { rtol: 1e-10, atol: 0.0 })
     .with_min_patch_bits(2);
-let result = patched_interpolate(
-    &TreeTciInterpolator::default(),
-    topology,
-    node_sites,
-    ColMajorArray::new(vec![0, 0], vec![2, 1])?,
-    |batch: ColMajorArrayRef<'_, usize>| -> anyhow::Result<Vec<f64>> {
-        Ok(batch.data().chunks(2).map(f).collect())
-    },
-    &options,
-)?;
+let result = {
+    let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
+    let backend: CpuBackend = context.with_backend(|backend| backend.clone());
+    let mut held = HeldSession::open(&backend)?;
+    let outcome = held.with_session(|view| {
+        patched_interpolate(
+            &TreeTciInterpolator::default(),
+            topology,
+            node_sites,
+            ColMajorArray::new(vec![0, 0], vec![2, 1]).expect("2D pivots"),
+            &mut EvalContext::new(
+                Session::from_backend_session(view.backend()),
+                Parallelism::Serial,
+            ),
+            |batch: ColMajorArrayRef<'_, usize>,
+             _ctx: &mut EvalContext<'_>|
+             -> anyhow::Result<Vec<f64>> { Ok(batch.data().chunks(2).map(f).collect()) },
+            &options,
+        )
+    });
+    held.close()?;
+    outcome?
+};
 
 assert_eq!(result.report.splits, 0);
 assert_eq!(result.report.accepted[0].status, PatchStatus::ToleranceNotMet);
@@ -496,8 +547,21 @@ with a central named node and three named leaves is a valid partition input.
 See the [Tree Tensor Networks guide](tree-tn.md) for constructing branched
 networks and selecting contraction/truncation options.
 
-## Migration
+## Migration from `tensor4all-partitionedtt`
 
-Use this crate for new named TreeTN partition work. The old
-`tensor4all-partitionedtt` crate remains buildable during migration and receives
-correctness and security fixes only; no removal date has been set.
+The retired `tensor4all-partitionedtt` crate (removed in #915 D3, settling
+#825) worked on the positional `SimpleTensorTrain` representation. This crate
+carries the same partition algebra on named `TreeTN` values:
+
+| `tensor4all-partitionedtt` | `tensor4all-partitionedtreetn` |
+|---|---|
+| `PartitionedTT` | `PartitionedTreeTN` |
+| `SubDomainTT::from_tt` | `SubDomainTreeTN::from_treetn` |
+| `PatchingOptions { rtol, .. }` | `PatchingOptions { cutoff = rtol², .. }` |
+| `add_with_patching(subdomains, &options)` | `add_with_patching(subdomains, &center, &options)` |
+| `truncate_adaptive(&tt, rtol, cap)` | `truncate_adaptive(&partition, &center, cutoff, allocation, cap)` |
+| `adaptiveinterpolate(...)` | `adaptive_interpolation::patched_interpolate(...)` |
+
+The adaptive interpolation driver needs an engine that implements
+`TreeInterpolator`; `tensor4all-treetci::TreeTciInterpolator` is the TreeTCI
+one. `benchmarks/rust/benchmark_patching.rs` is the ported patching benchmark.

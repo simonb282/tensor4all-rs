@@ -65,10 +65,10 @@ Direct cross interpolation on integer indices. TCI2 is the primary algorithm; TC
 
 ## tensor4all-core — caching + multi-index plumbing (TCI substrate, ex-tensor4all-tcicore)
 
-Shared interpolation plumbing includes `CachedFunction`, `MultiIndex`, packed assignment keys, and floating-zone searches. Prefer the higher-level interpolation crates for complete algorithms. `MultiIndex` is re-exported from `tensor4all-partitionedtt`.
+Shared interpolation plumbing includes `CachedFunction`, `MultiIndex`, packed assignment keys, and floating-zone searches. Prefer the higher-level interpolation crates for complete algorithms. `MultiIndex` is re-exported from `tensor4all-core` (and from `tensor4all-simplett` / `tensor4all-treetci`).
 
 - `CachedFunction::new(f, &local_dims)` — memoize expensive evaluations across sweeps. `.eval(&idx)`, `.cache_size()`, `.num_cache_hits()`. Worth it only when `f` is expensive; cheap functions lose to overhead.
-- `MultiIndex` = `Vec<usize>`, the coordinate type threaded through `tensorci` and `partitionedtt` callbacks.
+- `MultiIndex` = `Vec<usize>`, the coordinate type threaded through `tensorci` and `treetci` callbacks.
 - `index_key::IndexKey::owned_heap_bytes()` reports the key's owned heap payload, including spare dynamic-limb capacity; excludes its inline struct and allocator metadata. Use this when estimating a cache containing packed assignment keys.
 - `floating_zone_walk_with_initial_error` reuses a previously evaluated starting residual, then follows the same scan order and stopping rule as `floating_zone_walk`. Its typed `FloatingZoneError` distinguishes invalid dimensions, starts, residuals, or stopping tolerances from callback failures. This avoids evaluating a batched guard start a second time.
 
@@ -186,10 +186,20 @@ engine implementing `tensor4all_treetn::interpolation::TreeInterpolator`
   checked logical local tensor element counts after child truncation.
 - `add_with_patching(patches, &center, &options)` — split over-cap patches.
 - `adaptive_interpolation::patched_interpolate(&engine, topology, node_sites,
-  initial_pivots, evaluate, &PatchedInterpolationOptions)` — sequential tree
-  pQTCI. `evaluate` receives a column-major `[n_sites, n_points]` batch of
-  0-based full-domain points in the derived site order (nodes ascending, each
-  node's sites in order). An unaccepted patch splits at the next site of the
+  initial_pivots, &mut ctx, evaluate, &PatchedInterpolationOptions)` —
+  sequential tree pQTCI. `ctx` is the run's `EvalContext` over a session the
+  caller entered (`tensor4all_treetn::interpolation::EvalContext::new`); every
+  numerical stage runs on that session, and the result is published as compact
+  host storage. Two fan-out entries run the same driver:
+  `patched_interpolate_on_lanes(&mut lanes, ...)` takes a
+  `hataori_tenferro::TenferroLanes` and an `Fn + Sync` evaluator (each patch runs
+  in the lane's child session; the root wave and waves smaller than the lane
+  count run one patch at a time), and `patched_interpolate_mpi(&world, &mut
+  lanes, root, ...)` (features `hataori-mpi` / `hataori-mpi-rsmpi-rt`)
+  distributes waves over ranks through `hataori::pmap_lanes`, returning
+  `Option<result>` (`Some` on the root only). `evaluate` receives a column-major `[n_sites, n_points]`
+  batch of 0-based full-domain points in the derived site order (nodes
+  ascending, each node's sites in order) and the same context. An unaccepted patch splits at the next site of the
   (partial) `patch_order`. `PatchedInterpolationOptions::new(max_bond_dim)`
   (at least 2) plus `with_*` builders: `error_norm` (crate-root `ErrorNorm`;
   default `ErrorNorm::L2 { reference: L2Reference::Required }`), `tolerance`
@@ -298,41 +308,14 @@ All truncating and contracting operations require an explicit existing node name
 as `center`. Reconstruction remasks compressed candidates to preserve exact
 support zeros. No production path materializes a full network densely.
 
-## tensor4all-partitionedtt — legacy subdomain patches + adaptive TCI
+## (removed) tensor4all-partitionedtt
 
-This crate is deprecated during migration. Use `tensor4all-partitionedtreetn`
-for new named TreeTN work. It remains buildable and receives correctness and
-security fixes only; no removal date is set.
-
-Split a function's domain into non-overlapping projected patches, each its own TT. Use when a function is low-rank only after fixing some site indices. Re-exports `DynIndex`, `IdxTensor`, `MultiIndex`, `SimpleTensorTrain`, `ContractOptions`/`TruncateOptions`, `TCI2Options` — get them here rather than reaching into core internals.
-
-- `Projector` — maps site `DynIndex` → fixed coordinate, defining a subdomain.
-  - `Projector::new()`, `Projector::from_pairs([(idx, value), ...])?`.
-  - `.get(&idx) -> Option<usize>`, `.is_projected_at(&idx)`, `.insert(idx, value)?`, `.projected_indices()`, `.len()`, `.is_empty()`.
-- `SubDomainTT` — an itensorlike `TensorTrain` plus its `Projector`.
-  - `SubDomainTT::new(tt, projector)?`, `SubDomainTT::from_tt(tt)` (empty projector).
-  - `.data()`, `.projector()`, `.max_bond_dim()`, `.into_data()`, `.all_indices()`.
-- `PartitionedTT` — collection of mutually disjoint `SubDomainTT`s (disjointness validated at construction and insertion).
-  - `PartitionedTT::from_subdomains(vec)?`, `::from_subdomain(one)?`, `::new()`.
-  - `.len()`, `.is_empty()`, `.projectors()`, `.iter()`, `.values()`, `.contains(&projector)`.
-  - `.to_tensor_train() -> Result<SimpleTensorTrain>` — recombine all patches into one TT (drops the partition structure).
-  - `.contract(&other, &ContractOptions)?` (also free `contract` / `proj_contract`).
-- Adaptive patching — bond-cap-driven splitting plus volume-proportional truncation:
-  - `add_with_patching(subdomains: Vec<SubDomainTT>, &PatchingOptions) -> Result<PartitionedTT>` — split over-cap patches along `patch_order`, then truncate.
-  - `contract_adaptive(&left, &right, &ContractOptions, &PatchingOptions) -> Result<PartitionedTT>`.
-  - `truncate_adaptive(&PartitionedTT, rtol, max_bond_dim) -> Result<PartitionedTT>` — total budget `rtol²·‖F‖²` shared by patch volume; patches at/below their budget are dropped.
-  - `PatchingOptions { rtol: 1e-12, max_bond_dim: 100, patch_order: Vec<DynIndex>, split_strategy: ExactParameterGain }`.
-  - `PatchSplitStrategy::{Sequential, ExactParameterGain (default)}` — `ExactParameterGain` forms + counts child cores to pick the smallest split; `Sequential` takes the first unprojected `patch_order` index.
-- Adaptive TCI interpolation — ports TCIAlgorithms.jl `adaptiveinterpolate` / `createpatch` / `_globalpivots`:
-  - `adaptiveinterpolate::<T, F, B>(f, batched_f: Option<B>, site_indices: Vec<DynIndex>, initial_pivots: Vec<MultiIndex>, AdaptiveInterpolateOptions) -> Result<AdaptiveInterpolationResult<T>>`; use `.partitioned_tt()` and `.patch_caches()`.
-  - Default feature `adaptive-hataori-rayon` provides `adaptiveinterpolate_in(&Domain, ...)` with `LocalMode::Outer`; `adaptive-hataori-mpi` is default-off and provides collective `adaptiveinterpolate_mpi`.
-    - `f: &MultiIndex -> T` receives one **full, 0-based** multi-index (tensorci territory, not quanticstci).
-    - `batched_f: Option<B>` with `B: Fn(&[MultiIndex]) -> Vec<T>` — same function, batched; pass `None` when batching is unavailable.
-    - `initial_pivots` — full-domain, 0-based; empty allowed.
-  - `AdaptiveInterpolateOptions { tci_options: TCI2Options, patch_order: Vec<DynIndex>, n_initial_pivots: 5, recycle_pivots: false }`. Empty `patch_order` ⇒ site order; nonempty must be an exact full-`Index` permutation of `site_indices`.
-  - Flow: run TCI2 per patch on the active (unprojected) sites; **accept** only when `TCI2Termination::Converged` **and** final error ≤ `tci_options.tolerance`; otherwise split at the next `patch_order` index into one child per coordinate. Patches with 0/1 active sites are evaluated exactly. Reaching `max_bond_dim`/`max_iter` is a stop, not convergence — such a patch is split.
-  - `recycle_pivots = true` seeds children with a rejected parent's diagonal TCI pivots (opt-in; incompatible pivots discarded; every child is still replenished to `n_initial_pivots`).
-  - Sampled-zero policy: if every candidate evaluates below `1e-30` the patch is stored as zero — supply known-nonzero pivots for sparse functions.
+The legacy positional-TT crate was removed in #915 D3 (settling #825). Use
+`tensor4all-partitionedtreetn` above; the
+[Partitioned TreeTN guide](../../../docs/book/src/guides/partitioned-treetn.md)
+has the entry-point mapping (`PartitionedTT` -> `PartitionedTreeTN`,
+`adaptiveinterpolate` -> `adaptive_interpolation::patched_interpolate`,
+`rtol` -> `cutoff = rtol²`).
 
 ## tensor4all-hdf5 — ITensors.jl-compatible I/O
 
