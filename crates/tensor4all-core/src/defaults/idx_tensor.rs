@@ -34,6 +34,7 @@ use tensor4all_tensorbackend::{IncrementalQr, IncrementalQrScalar};
 use tensor4all_tensorbackend::{NonfiniteFlags, Storage, StorageKind};
 
 use super::contract::{ContractionOptions, PairwiseContractionOptions};
+use super::eager_session::{with_eager_session, with_engine, with_execution_engine};
 use super::structured_contraction::{
     normalize_payload_read_for_roots, storage_from_payload_native, storage_payload_native,
     OperandLayout, StructuredContractionPlan, StructuredContractionSpec,
@@ -42,9 +43,7 @@ use super::structured_contraction::{
 fn conjugate_eager(
     inner: &EagerTensor,
 ) -> std::result::Result<EagerTensor, Arc<dyn std::error::Error + Send + Sync + 'static>> {
-    inner
-        .runtime()
-        .with_eager_session(|session| session.conj(inner))
+    with_eager_session(inner.runtime(), None, |session| session.conj(inner))
         .map_err(|source| Arc::new(source) as _)
 }
 
@@ -410,6 +409,22 @@ pub enum IdxTensorError {
         #[source]
         source: Arc<dyn std::error::Error + Send + Sync + 'static>,
     },
+    /// An execution-context engine could not be entered.
+    ///
+    /// An implicit frontend entry resolves the engine from the eager runtime of
+    /// the operand it acts on (falling back to the process-global default CPU
+    /// context when that runtime has no live owner); the owner may be a CPU or a
+    /// CUDA context. A nested entry made while that engine is already borrowed on
+    /// the calling thread reports the typed
+    /// [`CpuExecutionContextError::Reentered`](tensor4all_tensorbackend::CpuExecutionContextError::Reentered)
+    /// or `CudaExecutionContextError::Reentered` here instead of waiting for the
+    /// engine.
+    #[error("IdxTensor engine entry failed: {source}")]
+    EngineEntry {
+        /// Original CPU or CUDA execution-context diagnostic.
+        #[source]
+        source: tensor4all_tensorbackend::ExecutionContextEntryError,
+    },
     /// A rank-zero scalar could not be extracted from a reduction result.
     #[error("IdxTensor scalar extraction failed: {source}")]
     ScalarExtraction {
@@ -510,6 +525,31 @@ impl From<tensor4all_tensorbackend::EagerContextError> for IdxTensorError {
     }
 }
 
+impl From<tensor4all_tensorbackend::CpuExecutionContextError> for IdxTensorError {
+    fn from(source: tensor4all_tensorbackend::CpuExecutionContextError) -> Self {
+        // Keep the typed context error in a concrete field (not `Arc<dyn
+        // Error>`) so a caller can match a nested-entry refusal directly.
+        Self::EngineEntry {
+            source: source.into(),
+        }
+    }
+}
+
+#[cfg(feature = "tenferro-cuda")]
+impl From<tensor4all_tensorbackend::CudaExecutionContextError> for IdxTensorError {
+    fn from(source: tensor4all_tensorbackend::CudaExecutionContextError) -> Self {
+        Self::EngineEntry {
+            source: source.into(),
+        }
+    }
+}
+
+impl From<tensor4all_tensorbackend::ExecutionContextEntryError> for IdxTensorError {
+    fn from(source: tensor4all_tensorbackend::ExecutionContextEntryError) -> Self {
+        Self::EngineEntry { source }
+    }
+}
+
 impl From<tensor4all_tensorbackend::BridgeError> for IdxTensorError {
     fn from(source: tensor4all_tensorbackend::BridgeError) -> Self {
         Self::Materialization {
@@ -523,7 +563,7 @@ impl IdxTensorError {
         Arc::from(error.into_boxed_dyn_error())
     }
 
-    fn materialization(error: anyhow::Error) -> Self {
+    pub(crate) fn materialization(error: anyhow::Error) -> Self {
         Self::Materialization {
             source: Self::boxed(error),
         }
@@ -545,7 +585,7 @@ impl IdxTensorError {
 
 /// Typed rejection for an execution context this build cannot execute in.
 #[cfg(not(feature = "tenferro-cuda"))]
-fn unsupported_execution_context_error() -> IdxTensorError {
+pub(crate) fn unsupported_execution_context_error() -> IdxTensorError {
     IdxTensorError::UnsupportedExecutionContext {
         required_feature: "tensor4all-core/tenferro-cuda",
     }
@@ -753,14 +793,17 @@ impl IdxTensorStorage {
     }
 
     fn materialize_eager_payload(inner: &EagerTensor) -> Result<NativeTensor> {
-        let native = inner.duplicate_value()?;
+        let native = with_engine(inner.runtime(), None, |engine| {
+            inner.duplicate_value(engine)
+        })?;
         if native.is_col_major_contiguous()? {
             return Ok(native);
         }
         let read = inner.tensor_read();
-        Ok(inner.runtime().with_execution_session(|session| {
-            session.to_contiguous_read(TensorRead::from_view(read.tensor_view()))
-        })??)
+        with_engine(inner.runtime(), None, |engine| {
+            engine.to_contiguous_read(TensorRead::from_view(read.tensor_view()))
+        })
+        .map_err(anyhow::Error::new)
     }
 
     fn materialize(
@@ -843,24 +886,24 @@ impl IdxTensorStorage {
         let payload = if payload.dtype() == target_dtype {
             payload
         } else {
-            payload
-                .runtime()
-                .with_eager_session(|session| session.cast(&payload, target_dtype))?
+            with_eager_session(payload.runtime(), None, |session| {
+                session.cast(&payload, target_dtype)
+            })?
         };
         let scalar_inner = if scalar_inner.dtype() == target_dtype {
             scalar_inner.clone()
         } else {
-            scalar_inner
-                .runtime()
-                .with_eager_session(|session| session.cast(scalar_inner, target_dtype))?
+            with_eager_session(scalar_inner.runtime(), None, |session| {
+                session.cast(scalar_inner, target_dtype)
+            })?
         };
         let scaled = if payload.shape().is_empty() {
-            payload
-                .runtime()
-                .with_eager_session(|session| session.mul(&payload, &scalar_inner))?
+            with_eager_session(payload.runtime(), None, |session| {
+                session.mul(&payload, &scalar_inner)
+            })?
         } else {
             let subscripts = IdxTensor::scale_subscripts(payload.shape().len())?;
-            payload.runtime().with_eager_session(|session| {
+            with_eager_session(payload.runtime(), None, |session| {
                 session.einsum_subscripts(&[&payload, &scalar_inner], &subscripts)
             })?
         };
@@ -1529,7 +1572,7 @@ impl IdxTensor {
                     continue;
                 }
             };
-            dense = dense.runtime().with_eager_session(|session| {
+            dense = with_eager_session(dense.runtime(), None, |session| {
                 session.embed_diag(&dense, first_axis, logical_axis)
             })?;
         }
@@ -1655,6 +1698,7 @@ impl IdxTensor {
     fn normalize_eager_payload_for_roots(
         payload: &EagerTensor,
         roots: &[usize],
+        context: Option<&ExecutionContext>,
     ) -> Result<(Option<EagerTensor>, Vec<usize>)> {
         if !(payload.shape().len() == roots.len()) {
             return Err(anyhow::anyhow!(
@@ -1668,11 +1712,9 @@ impl IdxTensor {
         let mut current_roots = roots.to_vec();
         while let Some((axis_a, axis_b)) = Self::first_duplicate_pair(&current_roots) {
             let source = current_payload.as_ref().unwrap_or(payload);
-            current_payload = Some(
-                source
-                    .runtime()
-                    .with_eager_session(|session| session.extract_diag(source, axis_a, axis_b))?,
-            );
+            current_payload = Some(with_eager_session(source.runtime(), context, |session| {
+                session.extract_diag(source, axis_a, axis_b)
+            })?);
             current_roots.remove(axis_b);
         }
 
@@ -1719,12 +1761,14 @@ impl IdxTensor {
         })
     }
 
+    /// Contract structured/diagonal payloads, on `context`'s engine when one is given.
     fn contract_structured_payloads(
         &self,
         other: &Self,
         result_indices: Vec<DynIndex>,
         axes_a: &[usize],
         axes_b: &[usize],
+        context: Option<&ExecutionContext>,
     ) -> Result<Self> {
         let (lhs_labels, rhs_labels, output_labels) = Self::build_binary_contraction_labels(
             self.indices.len(),
@@ -1732,11 +1776,12 @@ impl IdxTensor {
             other.indices.len(),
             axes_b,
         )?;
-        Self::contract_structured_payloads_nary(
+        Self::contract_structured_payloads_nary_in(
             &[self, other],
             result_indices,
             vec![lhs_labels, rhs_labels],
             output_labels,
+            context,
         )
     }
 
@@ -1745,6 +1790,30 @@ impl IdxTensor {
         result_indices: Vec<DynIndex>,
         input_labels: Vec<Vec<usize>>,
         output_labels: Vec<usize>,
+    ) -> Result<Self> {
+        Self::contract_structured_payloads_nary_in(
+            operands,
+            result_indices,
+            input_labels,
+            output_labels,
+            None,
+        )
+    }
+
+    /// Contract structured/diagonal payloads on the engine selected by `context`.
+    ///
+    /// Operands that live in an eager runtime (a diagonal operand built from a
+    /// compact payload, a tracked operand, or any operand of a caller-owned
+    /// context) contract their compact payloads through one eager einsum on that
+    /// engine. A diagonal scaling therefore stays a scaling on the caller's
+    /// engine instead of expanding into a dense operand. Host-only operands keep
+    /// the native bridge route.
+    pub(crate) fn contract_structured_payloads_nary_in(
+        operands: &[&Self],
+        result_indices: Vec<DynIndex>,
+        input_labels: Vec<Vec<usize>>,
+        output_labels: Vec<usize>,
+        context: Option<&ExecutionContext>,
     ) -> Result<Self> {
         if !(!operands.is_empty()) {
             return Err(anyhow::anyhow!("structured contraction needs operands"));
@@ -1765,8 +1834,16 @@ impl IdxTensor {
         };
         let plan = StructuredContractionPlan::new(&layouts, &spec)?;
         let any_grad = operands.iter().any(|operand| operand.tracks_grad());
+        // A context-scoped contraction runs the payload einsum on the context's
+        // engine. It needs eager payloads to do that, which every operand of an
+        // explicit context has; host-only operands stay on the native route.
+        let eager_payloads = any_grad
+            || (context.is_some()
+                && operands
+                    .iter()
+                    .all(|operand| operand.storage.eager().is_some()));
 
-        if any_grad {
+        if eager_payloads {
             let dtypes = operands
                 .iter()
                 .map(|operand| {
@@ -1782,9 +1859,9 @@ impl IdxTensor {
                 payloads.push(if payload.dtype() == target {
                     payload
                 } else {
-                    payload
-                        .runtime()
-                        .with_eager_session(|session| session.cast(&payload, target))?
+                    with_eager_session(payload.runtime(), context, |session| {
+                        session.cast(&payload, target)
+                    })?
                 });
             }
 
@@ -1793,8 +1870,11 @@ impl IdxTensor {
             for (operand_idx, (payload, operand_plan)) in
                 payloads.iter().zip(plan.operand_plans.iter()).enumerate()
             {
-                let (payload, roots) =
-                    Self::normalize_eager_payload_for_roots(payload, &operand_plan.class_roots)?;
+                let (payload, roots) = Self::normalize_eager_payload_for_roots(
+                    payload,
+                    &operand_plan.class_roots,
+                    context,
+                )?;
                 normalized.push(payload.unwrap_or_else(|| payloads[operand_idx].clone()));
                 labels.push(roots);
             }
@@ -1807,8 +1887,9 @@ impl IdxTensor {
                 .ok_or_else(|| {
                     anyhow::anyhow!("structured einsum requires at least one operand")
                 })?;
-            let payload = runtime
-                .with_eager_session(|session| session.einsum_subscripts(&refs, &subscripts))?;
+            let payload = with_eager_session(runtime, context, |session| {
+                session.einsum_subscripts(&refs, &subscripts)
+            })?;
             return Self::from_structured_payload_inner(
                 result_indices,
                 payload,
@@ -1934,9 +2015,9 @@ impl IdxTensor {
             if eager.dtype() == target {
                 Ok(eager.clone())
             } else {
-                Ok(eager
-                    .runtime()
-                    .with_eager_session(|session| session.cast(eager, target))?)
+                Ok(with_eager_session(eager.runtime(), None, |session| {
+                    session.cast(eager, target)
+                })?)
             }
         };
         Ok((cast(lhs)?, cast(rhs)?))
@@ -2871,16 +2952,14 @@ impl IdxTensor {
         // context-free helper cannot name.)
         let mut sliced = self.try_materialized_inner()?.clone();
         for (&axis, &position) in selected_axes.iter().zip(positions.iter()) {
-            sliced = sliced
-                .runtime()
-                .with_eager_session(|session| {
-                    session.slice_axis(&sliced, axis, position..position + 1)
-                })
-                .map_err(|error| anyhow::anyhow!("select_indices slicing failed: {error}"))?;
+            sliced = with_eager_session(sliced.runtime(), None, |session| {
+                session.slice_axis(&sliced, axis, position..position + 1)
+            })
+            .map_err(|error| anyhow::anyhow!("select_indices slicing failed: {error}"))?;
         }
-        let reshaped = sliced
-            .runtime()
-            .with_eager_session(|session| session.reshape(&sliced, &kept_dims))?;
+        let reshaped = with_eager_session(sliced.runtime(), None, |session| {
+            session.reshape(&sliced, &kept_dims)
+        })?;
         Self::from_inner(kept_indices, reshaped).map_err(IdxTensorError::from)
     }
 
@@ -3000,11 +3079,12 @@ impl IdxTensor {
             .iter()
             .map(|tensor| tensor.try_materialized_inner())
             .collect::<Result<Vec<_>>>()?;
-        let stacked = inner_refs
+        let runtime = inner_refs
             .first()
             .map(|tensor| tensor.runtime())
-            .ok_or_else(|| anyhow::anyhow!("stack_along_new_index requires at least one tensor"))?
-            .with_eager_session(|session| session.stack(&inner_refs, axis))?;
+            .ok_or_else(|| anyhow::anyhow!("stack_along_new_index requires at least one tensor"))?;
+        let stacked =
+            with_eager_session(runtime, None, |session| session.stack(&inner_refs, axis))?;
         Self::from_inner(result_indices, stacked).map_err(IdxTensorError::from)
     }
 
@@ -3070,9 +3150,9 @@ impl IdxTensor {
         let axis = isize::try_from(axis)
             .map_err(|_| anyhow::anyhow!("index_select: axis does not fit in isize"))?;
         let inner = self.try_materialized_inner()?;
-        let selected = inner
-            .runtime()
-            .with_eager_session(|session| session.index_select(inner, axis, positions))?;
+        let selected = with_eager_session(inner.runtime(), None, |session| {
+            session.index_select(inner, axis, positions)
+        })?;
         let mut result_indices = self.indices.clone();
         result_indices[axis as usize] = target_index;
         Self::from_inner(result_indices, selected).map_err(IdxTensorError::from)
@@ -3441,10 +3521,10 @@ impl IdxTensor {
         };
 
         let input = self.try_materialized_inner()?;
-        let (values, vectors) = input
-            .runtime()
-            .with_eager_session(|session| session.eigh(input))
-            .map_err(|source| anyhow::anyhow!("Hermitian eigendecomposition failed: {source}"))?;
+        let (values, vectors) =
+            with_eager_session(input.runtime(), None, |session| session.eigh(input)).map_err(
+                |source| anyhow::anyhow!("Hermitian eigendecomposition failed: {source}"),
+            )?;
 
         let eigenvalue_index = DynIndex::new_dyn(dims[0]);
         let eigenvector_index = DynIndex::new_dyn(dims[0]);
@@ -3498,10 +3578,19 @@ impl IdxTensor {
         let payload_len = checked_product(payload_inner.shape())?;
         Self::validate_diag_payload_len(payload_len, &dims)?;
         let axis_classes = Self::diag_axis_classes(dims.len());
-        let diag_inner = payload_inner
-            .runtime()
-            .with_eager_session(|session| session.embed_diag(&payload_inner, 0, 1))?;
-        Self::from_inner_with_axis_classes(indices, diag_inner, axis_classes)
+        // The diagonal payload is stored as the compact payload directly. Embedding
+        // it into a dense tensor only to extract it again would enter the eager
+        // runtime for no numerical work and bind the result to one engine.
+        let payload_dims = payload_inner.shape().to_vec();
+        Ok(Self {
+            indices,
+            storage: IdxTensorStorage::Compact(Arc::new(StructuredPayload {
+                payload: Arc::new(payload_inner),
+                payload_dims,
+                axis_classes,
+            })),
+            eager_cache: Self::empty_eager_cache(),
+        })
     }
 
     fn compact_inner_from_logical(
@@ -3511,9 +3600,9 @@ impl IdxTensor {
         let mut payload = inner.clone();
         let mut classes = axis_classes.to_vec();
         while let Some((axis_a, axis_b)) = Self::first_duplicate_pair(&classes) {
-            payload = payload
-                .runtime()
-                .with_eager_session(|session| session.extract_diag(&payload, axis_a, axis_b))?;
+            payload = with_eager_session(payload.runtime(), None, |session| {
+                session.extract_diag(&payload, axis_a, axis_b)
+            })?;
             classes.remove(axis_b);
         }
         Ok(payload)
@@ -3641,7 +3730,11 @@ impl IdxTensor {
 
     #[cfg(feature = "tenferro-cuda")]
     pub(crate) fn cuda_duplicate_native(&self) -> Result<NativeTensor> {
-        Ok(self.try_materialized_inner()?.duplicate_value()?)
+        let inner = self.try_materialized_inner()?;
+        with_engine(inner.runtime(), None, |engine| {
+            inner.duplicate_value(engine)
+        })
+        .map_err(anyhow::Error::new)
     }
 
     /// Enable reverse-mode AD tracking on this tensor by creating a tracked leaf.
@@ -3661,7 +3754,9 @@ impl IdxTensor {
             .or_else(|| self.eager_cache.get().map(AsRef::as_ref))
             .filter(|inner| inner.shape() == self.storage.payload_dims());
         let payload = match eager_payload {
-            Some(inner) => inner.duplicate_value()?,
+            Some(inner) => with_engine(inner.runtime(), None, |engine| {
+                inner.duplicate_value(engine)
+            })?,
             None => {
                 let materialized = self.storage.materialize(self.indices.len())?;
                 storage_payload_native(materialized.as_ref())
@@ -3703,6 +3798,12 @@ impl IdxTensor {
     }
 
     /// Return the accumulated gradient, if one has been stored.
+    ///
+    /// This implicit entry uses the engine of the CPU context that owns the
+    /// gradient's eager runtime, falling back to the process-global default CPU
+    /// context when that runtime has no live owner (the transitional implicit
+    /// route); the engine-explicit API will replace it.
+    ///
     /// # Errors
     /// Returns an [`IdxTensorError`] when the AD backend cannot read or
     /// materialize the accumulated gradient; a tensor with no recorded gradient
@@ -3714,7 +3815,9 @@ impl IdxTensor {
                 return Ok(None);
             };
             let gradient_shape = gradient.shape().to_vec();
-            let gradient_tensor = gradient.to_tensor()?;
+            let gradient_tensor = with_engine(value.payload.runtime(), None, |engine| {
+                gradient.to_tensor(engine)
+            })?;
             if self.compact_payload_is_logical_dense(&value.payload_dims) {
                 return Ok(Some(Self::from_native_with_axis_classes(
                     self.indices.clone(),
@@ -3739,12 +3842,13 @@ impl IdxTensor {
             )?));
         }
 
-        let Some(gradient) = self.try_materialized_inner()?.grad()? else {
+        let inner = self.try_materialized_inner()?;
+        let Some(gradient) = inner.grad()? else {
             return Ok(None);
         };
         Ok(Some(Self::from_native_with_axis_classes(
             self.indices.clone(),
-            gradient.to_tensor()?,
+            with_engine(inner.runtime(), None, |engine| gradient.to_tensor(engine))?,
             self.storage.axis_classes().to_vec(),
         )?))
     }
@@ -3769,31 +3873,44 @@ impl IdxTensor {
     }
 
     /// Run reverse-mode autodiff from this scalar tensor.
+    ///
+    /// This implicit entry uses the engine of the CPU context that owns the
+    /// tensor's eager runtime, falling back to the process-global default CPU
+    /// context when that runtime has no live owner (the transitional implicit
+    /// route); the engine-explicit API will replace it.
+    ///
     /// # Errors
     /// Returns an [`IdxTensorError`] when the reverse pass fails; a non-scalar
     /// tensor is rejected by the AD backend.
     ///
     pub fn backward(&self) -> std::result::Result<(), IdxTensorError> {
         if let Some(value) = self.tracked_compact_payload_value() {
-            return value.payload.backward().map(|_| ()).map_err(|e| {
-                IdxTensorError::from(anyhow::anyhow!("IdxTensor::backward failed: {e}"))
-            });
+            return with_execution_engine(value.payload.runtime(), None, |engine| {
+                value.payload.backward(engine)
+            })
+            .map(|_| ());
         }
-        self.try_materialized_inner()?
-            .backward()
-            .map(|_| ())
-            .map_err(|e| IdxTensorError::from(anyhow::anyhow!("IdxTensor::backward failed: {e}")))
+        let inner = self.try_materialized_inner()?;
+        with_execution_engine(inner.runtime(), None, |engine| inner.backward(engine)).map(|_| ())
     }
 
     /// Detach this tensor from the reverse graph.
+    ///
+    /// This implicit entry uses the engine of the CPU context that owns the
+    /// tensor's eager runtime, falling back to the process-global default CPU
+    /// context when that runtime has no live owner (the transitional implicit
+    /// route); the engine-explicit API will replace it.
+    ///
     /// # Errors
     /// Returns an [`IdxTensorError`] when the eager payload cannot be
     /// materialized or when the detached tensor cannot be rebuilt.
     ///
     pub fn detach(&self) -> std::result::Result<Self, IdxTensorError> {
+        let inner = self.try_materialized_inner()?;
+        let detached = with_engine(inner.runtime(), None, |engine| inner.detach(engine))?;
         Self::from_inner_with_axis_classes(
             self.indices.clone(),
-            self.try_materialized_inner()?.detach(),
+            detached,
             self.storage.axis_classes().to_vec(),
         )
         .map_err(IdxTensorError::from)
@@ -3921,9 +4038,9 @@ impl IdxTensor {
         }
         if let Some(payload) = self.storage.eager().filter(|payload| payload.tracks_grad()) {
             let axes: Vec<usize> = (0..payload.shape().len()).collect();
-            let reduced = payload
-                .runtime()
-                .with_eager_session(|session| session.reduce_sum(payload, Some(&axes)))?;
+            let reduced = with_eager_session(payload.runtime(), None, |session| {
+                session.reduce_sum(payload, Some(&axes))
+            })?;
             return AnyScalar::from_tensor(Self::from_inner(Vec::new(), reduced)?)
                 .map_err(IdxTensorError::from);
         }
@@ -4013,9 +4130,9 @@ impl IdxTensor {
         }
 
         let inner = self.try_materialized_inner()?;
-        let permuted = inner
-            .runtime()
-            .with_eager_session(|session| session.transpose(inner, &perm))?;
+        let permuted = with_eager_session(inner.runtime(), None, |session| {
+            session.transpose(inner, &perm)
+        })?;
         let axis_classes = self.permute_axis_classes(&perm);
         Self::from_inner_with_axis_classes(new_indices.to_vec(), permuted, axis_classes)
             .map_err(IdxTensorError::from)
@@ -4063,9 +4180,9 @@ impl IdxTensor {
         // Permute indices
         let new_indices: Vec<DynIndex> = perm.iter().map(|&i| self.indices[i].clone()).collect();
         let inner = self.try_materialized_inner()?;
-        let permuted = inner
-            .runtime()
-            .with_eager_session(|session| session.transpose(inner, perm))?;
+        let permuted = with_eager_session(inner.runtime(), None, |session| {
+            session.transpose(inner, perm)
+        })?;
         let axis_classes = self.permute_axis_classes(perm);
         Self::from_inner_with_axis_classes(new_indices, permuted, axis_classes)
             .map_err(IdxTensorError::from)
@@ -4079,6 +4196,28 @@ impl IdxTensor {
         &self,
         other: &Self,
         options: PairwiseContractionOptions,
+    ) -> Result<Self> {
+        self.try_contract_pairwise_default_with_options_scoped(other, options, None)
+    }
+
+    /// Contract a pair on the engine selected by `context`.
+    ///
+    /// The result keeps the operands' own eager runtime; only the engine that
+    /// executes the contraction is selected by the caller.
+    pub(crate) fn try_contract_pairwise_default_with_options_in(
+        &self,
+        other: &Self,
+        options: PairwiseContractionOptions,
+        context: &ExecutionContext,
+    ) -> Result<Self> {
+        self.try_contract_pairwise_default_with_options_scoped(other, options, Some(context))
+    }
+
+    fn try_contract_pairwise_default_with_options_scoped(
+        &self,
+        other: &Self,
+        options: PairwiseContractionOptions,
+        context: Option<&ExecutionContext>,
     ) -> Result<Self> {
         // Device-resident structured/diagonal operands cannot enter the native
         // host session used below; route them through the owning-runtime eager
@@ -4141,6 +4280,7 @@ impl IdxTensor {
                     spec.result_indices,
                     &spec.axes_a,
                     &spec.axes_b,
+                    context,
                 )
             });
         }
@@ -4162,10 +4302,9 @@ impl IdxTensor {
             let result = profile_pairwise_contract_section("scalar_mul", || {
                 let lhs = self.try_materialized_inner()?;
                 let rhs = other.try_materialized_inner()?;
-                Ok::<_, anyhow::Error>(
-                    lhs.runtime()
-                        .with_eager_session(|session| session.mul(lhs, rhs))?,
-                )
+                Ok::<_, anyhow::Error>(with_eager_session(lhs.runtime(), context, |session| {
+                    session.mul(lhs, rhs)
+                })?)
             })?;
             return profile_pairwise_contract_section("from_inner", || {
                 Self::from_inner(spec.result_indices, result)
@@ -4210,7 +4349,7 @@ impl IdxTensor {
         })?;
         let result = profile_pairwise_contract_section("dot_general_with_conj", || {
             profile_pairwise_contract_section("dot_general_execute", || {
-                lhs.runtime().with_eager_session(|session| {
+                with_eager_session(lhs.runtime(), context, |session| {
                     session.dot_general_with_conj(
                         lhs,
                         rhs,
@@ -4304,12 +4443,10 @@ impl IdxTensor {
         };
         let lhs = self.try_materialized_inner()?;
         let rhs = other.try_materialized_inner()?;
-        let result = lhs
-            .runtime()
-            .with_eager_session(|session| {
-                session.dot_general_with_conj(lhs, rhs, config, false, false)
-            })
-            .map_err(|error| anyhow::anyhow!("retained pairwise contraction failed: {error}"))?;
+        let result = with_eager_session(lhs.runtime(), None, |session| {
+            session.dot_general_with_conj(lhs, rhs, config, false, false)
+        })
+        .map_err(|error| anyhow::anyhow!("retained pairwise contraction failed: {error}"))?;
 
         // dot_general emits [lhs_free, rhs_free, batch]. Restore the index
         // order used by contract_with_options, where retained axes occur at
@@ -4380,9 +4517,9 @@ impl IdxTensor {
                         })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            result
-                .runtime()
-                .with_eager_session(|session| session.transpose(&result, &permutation))?
+            with_eager_session(result.runtime(), None, |session| {
+                session.transpose(&result, &permutation)
+            })?
         };
         Self::from_inner(desired_indices, result)
     }
@@ -4443,15 +4580,14 @@ impl IdxTensor {
                 spec.result_indices,
                 &spec.axes_a,
                 &spec.axes_b,
+                None,
             );
         }
 
         if self.indices.is_empty() && other.indices.is_empty() {
             let lhs = self.try_materialized_inner()?;
             let rhs = other.try_materialized_inner()?;
-            let result = lhs
-                .runtime()
-                .with_eager_session(|session| session.mul(lhs, rhs))
+            let result = with_eager_session(lhs.runtime(), None, |session| session.mul(lhs, rhs))
                 .map_err(|e| anyhow::anyhow!("tensordot scalar multiply failed: {e}"))?;
             return Self::from_inner(spec.result_indices, result);
         }
@@ -4480,10 +4616,10 @@ impl IdxTensor {
             other.indices.len(),
             &spec.axes_b,
         )?;
-        let result = lhs
-            .runtime()
-            .with_eager_session(|session| session.einsum_subscripts(&[lhs, rhs], &subscripts))
-            .map_err(|e| anyhow::anyhow!("tensordot failed: {e}"))?;
+        let result = with_eager_session(lhs.runtime(), None, |session| {
+            session.einsum_subscripts(&[lhs, rhs], &subscripts)
+        })
+        .map_err(|e| anyhow::anyhow!("tensordot failed: {e}"))?;
         Self::from_inner_with_axis_classes(spec.result_indices, result, result_axis_classes)
     }
 
@@ -4516,7 +4652,7 @@ impl IdxTensor {
             &[],
         )?;
         if self.should_use_structured_payload_contract(other) {
-            return self.contract_structured_payloads(other, result_indices, &[], &[]);
+            return self.contract_structured_payloads(other, result_indices, &[], &[], None);
         }
         let self_inner = self.try_materialized_inner()?;
         let other_inner = other.try_materialized_inner()?;
@@ -4542,10 +4678,10 @@ impl IdxTensor {
             other.indices.len(),
             &[],
         )?;
-        let result = lhs
-            .runtime()
-            .with_eager_session(|session| session.einsum_subscripts(&[lhs, rhs], &subscripts))
-            .map_err(|e| anyhow::anyhow!("outer_product failed: {e}"))?;
+        let result = with_eager_session(lhs.runtime(), None, |session| {
+            session.einsum_subscripts(&[lhs, rhs], &subscripts)
+        })
+        .map_err(|e| anyhow::anyhow!("outer_product failed: {e}"))?;
         Self::from_inner_with_axis_classes(result_indices, result, result_axis_classes)
     }
 }
@@ -4800,10 +4936,10 @@ impl IdxTensor {
         let rhs = other_aligned.scale(b)?;
         let lhs_inner = lhs.try_materialized_inner()?;
         let rhs_inner = rhs.try_materialized_inner()?;
-        let combined = lhs_inner
-            .runtime()
-            .with_eager_session(|session| session.add(lhs_inner, rhs_inner))
-            .map_err(|e| anyhow::anyhow!("tensor addition failed: {e}"))?;
+        let combined = with_eager_session(lhs_inner.runtime(), None, |session| {
+            session.add(lhs_inner, rhs_inner)
+        })
+        .map_err(|e| anyhow::anyhow!("tensor addition failed: {e}"))?;
         Self::from_inner_with_axis_classes(self.indices.clone(), combined, axis_classes)
             .map_err(IdxTensorError::from)
     }
@@ -4854,31 +4990,29 @@ impl IdxTensor {
             let self_inner = if self_inner.dtype() == target_dtype {
                 self_inner.clone()
             } else {
-                self_inner
-                    .runtime()
-                    .with_eager_session(|session| session.cast(self_inner, target_dtype))?
+                with_eager_session(self_inner.runtime(), None, |session| {
+                    session.cast(self_inner, target_dtype)
+                })?
             };
             let scalar_inner = scalar.as_tensor()?.try_materialized_inner()?;
             let scalar_inner = if scalar_inner.dtype() == target_dtype {
                 scalar_inner.clone()
             } else {
-                scalar_inner
-                    .runtime()
-                    .with_eager_session(|session| session.cast(scalar_inner, target_dtype))?
+                with_eager_session(scalar_inner.runtime(), None, |session| {
+                    session.cast(scalar_inner, target_dtype)
+                })?
             };
             let scaled = if self.indices.is_empty() {
-                self_inner
-                    .runtime()
-                    .with_eager_session(|session| session.mul(&self_inner, &scalar_inner))
-                    .map_err(|e| anyhow::anyhow!("scalar multiplication failed: {e}"))?
+                with_eager_session(self_inner.runtime(), None, |session| {
+                    session.mul(&self_inner, &scalar_inner)
+                })
+                .map_err(|e| anyhow::anyhow!("scalar multiplication failed: {e}"))?
             } else {
                 let subscripts = Self::scale_subscripts(self.indices.len())?;
-                self_inner
-                    .runtime()
-                    .with_eager_session(|session| {
-                        session.einsum_subscripts(&[&self_inner, &scalar_inner], &subscripts)
-                    })
-                    .map_err(|e| anyhow::anyhow!("tensor scaling failed: {e}"))?
+                with_eager_session(self_inner.runtime(), None, |session| {
+                    session.einsum_subscripts(&[&self_inner, &scalar_inner], &subscripts)
+                })
+                .map_err(|e| anyhow::anyhow!("tensor scaling failed: {e}"))?
             };
             return Self::from_inner_with_axis_classes(
                 self.indices.clone(),
@@ -4890,18 +5024,16 @@ impl IdxTensor {
         let self_inner = self.try_materialized_inner()?;
         let scalar_inner = scalar.as_tensor()?.try_materialized_inner()?;
         let scaled = if self.indices.is_empty() {
-            self_inner
-                .runtime()
-                .with_eager_session(|session| session.mul(self_inner, scalar_inner))
-                .map_err(|e| anyhow::anyhow!("scalar multiplication failed: {e}"))?
+            with_eager_session(self_inner.runtime(), None, |session| {
+                session.mul(self_inner, scalar_inner)
+            })
+            .map_err(|e| anyhow::anyhow!("scalar multiplication failed: {e}"))?
         } else {
             let subscripts = Self::scale_subscripts(self.indices.len())?;
-            self_inner
-                .runtime()
-                .with_eager_session(|session| {
-                    session.einsum_subscripts(&[self_inner, scalar_inner], &subscripts)
-                })
-                .map_err(|e| anyhow::anyhow!("tensor scaling failed: {e}"))?
+            with_eager_session(self_inner.runtime(), None, |session| {
+                session.einsum_subscripts(&[self_inner, scalar_inner], &subscripts)
+            })
+            .map_err(|e| anyhow::anyhow!("tensor scaling failed: {e}"))?
         };
         Self::from_inner_with_axis_classes(
             self.indices.clone(),
@@ -6112,7 +6244,9 @@ pub fn unfold_split(
         unfold_split_inner(t, left_inds)?;
 
     Ok((
-        matrix_inner.duplicate_value()?,
+        with_engine(matrix_inner.runtime(), None, |engine| {
+            matrix_inner.duplicate_value(engine)
+        })?,
         left_len,
         m,
         n,
@@ -6182,11 +6316,62 @@ pub(crate) fn unfold_split_inner(
     t: &IdxTensor,
     left_inds: &[DynIndex],
 ) -> Result<UnfoldSplitInnerResult> {
+    unfold_split_inner_scoped(t, left_inds, None)
+}
+
+/// Unfold a tensor using the engine selected by `context`.
+///
+/// The context-scoped factorization routes use this form so the permutation and
+/// reshape run on the caller's engine; host storage is adopted into the context
+/// first, exactly as the context-aware constructors do.
+pub(crate) fn unfold_split_inner_in(
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+    context: &ExecutionContext,
+) -> Result<UnfoldSplitInnerResult> {
+    unfold_split_inner_scoped(t, left_inds, Some(context))
+}
+
+fn unfold_split_inner_scoped(
+    t: &IdxTensor,
+    left_inds: &[DynIndex],
+    context: Option<&ExecutionContext>,
+) -> Result<UnfoldSplitInnerResult> {
     let (left_indices, right_indices, new_indices) = unfold_index_sets(t, left_inds)?;
     let left_len = left_indices.len();
 
+    // A context-scoped split adopts host storage into the context so its
+    // permutation and reshape do not reach the process-global default engine.
+    let adopted;
+    let tensor = match context {
+        Some(context) if t.eager_runtime().is_none() => {
+            adopted = IdxTensor::adopt_host_into_context(t, context)?;
+            &adopted
+        }
+        _ => t,
+    };
+
     // Permute tensor to have left indices first, then right indices
-    let unfolded = t.permute_indices(&new_indices)?;
+    let unfolded = match context {
+        Some(context) => {
+            let perm = compute_permutation_from_indices(&tensor.indices, &new_indices)?;
+            if perm.iter().copied().eq(0..perm.len()) {
+                IdxTensor {
+                    indices: new_indices,
+                    storage: tensor.storage.clone(),
+                    eager_cache: Arc::clone(&tensor.eager_cache),
+                }
+            } else {
+                let inner = tensor.try_materialized_inner()?;
+                let permuted = with_eager_session(inner.runtime(), Some(context), |session| {
+                    session.transpose(inner, &perm)
+                })?;
+                let axis_classes = tensor.permute_axis_classes(&perm);
+                IdxTensor::from_inner_with_axis_classes(new_indices, permuted, axis_classes)?
+            }
+        }
+        None => tensor.permute_indices(&new_indices)?,
+    };
 
     // Compute matrix dimensions
     let unfolded_dims = unfolded.dims();
@@ -6194,9 +6379,9 @@ pub(crate) fn unfold_split_inner(
     let n = checked_product(&unfolded_dims[left_len..])?;
 
     let unfolded_inner = unfolded.try_materialized_inner()?;
-    let matrix_tensor = unfolded_inner
-        .runtime()
-        .with_eager_session(|session| session.reshape(unfolded_inner, [m, n]))?;
+    let matrix_tensor = with_eager_session(unfolded_inner.runtime(), context, |session| {
+        session.reshape(unfolded_inner, [m, n])
+    })?;
 
     Ok((matrix_tensor, left_len, m, n, left_indices, right_indices))
 }
@@ -6507,8 +6692,6 @@ impl IdxTensor {
         left_inds: &[DynIndex],
         context: &ExecutionContext,
     ) -> std::result::Result<FactorizeResult<IdxTensor>, FactorizeError> {
-        use crate::defaults::idx_tensor::unfold_split_inner;
-
         // The host path consumes `batch_index` as the appended-axis label;
         // reject a mismatched label before any arithmetic, as the device path
         // otherwise never observes it.
@@ -6517,9 +6700,10 @@ impl IdxTensor {
                 "resident probe batch is missing its batch index"
             )));
         }
-        let (appended_inner, _, m, b, _, _) = unfold_split_inner(batch_tensor, left_inds)
-            .context("resident probe batch unfold failed")
-            .map_err(FactorizeError::ComputationError)?;
+        let (appended_inner, _, m, b, _, _) =
+            unfold_split_inner_in(batch_tensor, left_inds, context)
+                .context("resident probe batch unfold failed")
+                .map_err(FactorizeError::ComputationError)?;
         if !matches!(appended_inner.dtype(), DType::F64 | DType::C64) {
             return Err(FactorizeError::UnsupportedStorage(
                 "incremental SRC factorization currently supports f64 and Complex64 tensors",
@@ -6535,7 +6719,7 @@ impl IdxTensor {
         }
         let full_inner = if let Some(previous) = previous {
             let (q_inner, _, previous_rows, _, _, _) =
-                unfold_split_inner(&previous.left, left_inds)
+                unfold_split_inner_in(&previous.left, left_inds, context)
                     .context("resident previous Q unfold failed")
                     .map_err(FactorizeError::ComputationError)?;
             if previous_rows != m {
@@ -6543,28 +6727,29 @@ impl IdxTensor {
                     "previous and appended sketch row dimensions differ: {previous_rows} vs {m}"
                 )));
             }
-            let (r_inner, _, _, _, _, _) =
-                unfold_split_inner(&previous.right, std::slice::from_ref(&previous.bond_index))
-                    .context("resident previous R unfold failed")
-                    .map_err(FactorizeError::ComputationError)?;
-            let reconstructed = q_inner
-                .runtime()
-                .with_eager_session(|session| session.matmul(&q_inner, &r_inner))
-                .map_err(|error| {
-                    FactorizeError::ComputationError(
-                        anyhow::Error::new(error).context("resident sketch reconstruction failed"),
-                    )
-                })?;
-            reconstructed
-                .runtime()
-                .with_eager_session(|session| {
-                    session.concatenate(&[&reconstructed, &appended_inner], 1)
-                })
-                .map_err(|error| {
-                    FactorizeError::ComputationError(
-                        anyhow::Error::new(error).context("resident sketch concatenation failed"),
-                    )
-                })?
+            let (r_inner, _, _, _, _, _) = unfold_split_inner_in(
+                &previous.right,
+                std::slice::from_ref(&previous.bond_index),
+                context,
+            )
+            .context("resident previous R unfold failed")
+            .map_err(FactorizeError::ComputationError)?;
+            let reconstructed = with_eager_session(q_inner.runtime(), Some(context), |session| {
+                session.matmul(&q_inner, &r_inner)
+            })
+            .map_err(|error| {
+                FactorizeError::ComputationError(
+                    anyhow::Error::new(error).context("resident sketch reconstruction failed"),
+                )
+            })?;
+            with_eager_session(reconstructed.runtime(), Some(context), |session| {
+                session.concatenate(&[&reconstructed, &appended_inner], 1)
+            })
+            .map_err(|error| {
+                FactorizeError::ComputationError(
+                    anyhow::Error::new(error).context("resident sketch concatenation failed"),
+                )
+            })?
         } else {
             appended_inner
         };
@@ -6574,19 +6759,17 @@ impl IdxTensor {
             ))
         })?;
         let rank_tolerance = 32.0 * f64::EPSILON * m.max(total_width) as f64;
-        let decomposition = full_inner
-            .runtime()
-            .with_eager_session(|session| {
-                session.rank_revealing_qr(
-                    &full_inner,
-                    RankRevealingQrOptions::default().rtol(rank_tolerance),
-                )
-            })
-            .map_err(|error| {
-                FactorizeError::ComputationError(
-                    anyhow::Error::new(error).context("resident probe batch RRQR failed"),
-                )
-            })?;
+        let decomposition = with_eager_session(full_inner.runtime(), Some(context), |session| {
+            session.rank_revealing_qr(
+                &full_inner,
+                RankRevealingQrOptions::default().rtol(rank_tolerance),
+            )
+        })
+        .map_err(|error| {
+            FactorizeError::ComputationError(
+                anyhow::Error::new(error).context("resident probe batch RRQR failed"),
+            )
+        })?;
         let rank = Self::read_resident_rank(&decomposition.rank, context)?;
         let maximum_rank = m.min(total_width);
         if rank > maximum_rank {
@@ -6602,31 +6785,29 @@ impl IdxTensor {
                 )));
             }
         }
-        let q_full = decomposition
-            .q
-            .runtime()
-            .with_eager_session(|session| session.slice_axis(&decomposition.q, 1, 0..rank))
-            .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+        let q_full = with_eager_session(decomposition.q.runtime(), Some(context), |session| {
+            session.slice_axis(&decomposition.q, 1, 0..rank)
+        })
+        .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
         // RRQR factors the pivoted sketch A[:, permutation]. Restore the
         // original sketch-column order without reading permutation metadata:
         // Q_rank^H A computes the equivalent right factor entirely resident.
-        let transposed = q_full
-            .runtime()
-            .with_eager_session(|session| session.transpose(&q_full, &[1, 0]))
-            .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
-        let q_adjoint = transposed
-            .runtime()
-            .with_eager_session(|session| session.conj(&transposed))
-            .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
-        let r_full = q_adjoint
-            .runtime()
-            .with_eager_session(|session| session.matmul(&q_adjoint, &full_inner))
-            .map_err(|error| {
-                FactorizeError::ComputationError(
-                    anyhow::Error::new(error)
-                        .context("resident RRQR right-factor restoration failed"),
-                )
-            })?;
+        let transposed = with_eager_session(q_full.runtime(), Some(context), |session| {
+            session.transpose(&q_full, &[1, 0])
+        })
+        .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+        let q_adjoint = with_eager_session(transposed.runtime(), Some(context), |session| {
+            session.conj(&transposed)
+        })
+        .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+        let r_full = with_eager_session(q_adjoint.runtime(), Some(context), |session| {
+            session.matmul(&q_adjoint, &full_inner)
+        })
+        .map_err(|error| {
+            FactorizeError::ComputationError(
+                anyhow::Error::new(error).context("resident RRQR right-factor restoration failed"),
+            )
+        })?;
         let cap = DynIndex::new_bond(rank)
             .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
         let batch = DynIndex::new_link(total_width)
@@ -6636,26 +6817,26 @@ impl IdxTensor {
         let q_dims: Vec<usize> = q_indices.iter().map(|index| index.dim()).collect();
         let left = Self::from_inner(
             q_indices,
-            q_full
-                .runtime()
-                .with_eager_session(|session| session.reshape(&q_full, &q_dims))
-                .map_err(|error| {
-                    FactorizeError::ComputationError(
-                        anyhow::Error::new(error).context("resident probe batch Q reshape failed"),
-                    )
-                })?,
+            with_eager_session(q_full.runtime(), Some(context), |session| {
+                session.reshape(&q_full, &q_dims)
+            })
+            .map_err(|error| {
+                FactorizeError::ComputationError(
+                    anyhow::Error::new(error).context("resident probe batch Q reshape failed"),
+                )
+            })?,
         )
         .map_err(FactorizeError::ComputationError)?;
         let right = Self::from_inner(
             vec![cap.clone(), batch],
-            r_full
-                .runtime()
-                .with_eager_session(|session| session.reshape(&r_full, [rank, total_width]))
-                .map_err(|error| {
-                    FactorizeError::ComputationError(
-                        anyhow::Error::new(error).context("resident probe batch R reshape failed"),
-                    )
-                })?,
+            with_eager_session(r_full.runtime(), Some(context), |session| {
+                session.reshape(&r_full, [rank, total_width])
+            })
+            .map_err(|error| {
+                FactorizeError::ComputationError(
+                    anyhow::Error::new(error).context("resident probe batch R reshape failed"),
+                )
+            })?,
         )
         .map_err(FactorizeError::ComputationError)?;
         Ok(FactorizeResult::new(left, right, cap, None, rank))
@@ -6705,9 +6886,10 @@ impl IdxTensor {
         // The pinned eager API offers no general solve, so this estimator reads the resident factor back once and
         // reuses the host estimator: it returns scalars either way, and the round-trip sits on an error estimate
         // rather than in a sweep.
-        let native = inner
-            .to_tensor()
-            .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
+        let native = with_engine(inner.runtime(), Some(context), |engine| {
+            inner.to_tensor(engine)
+        })
+        .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
         let host_native = cuda
             .download(&native)
             .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
@@ -6730,7 +6912,10 @@ impl IdxTensor {
         #[cfg(not(feature = "tenferro-cuda"))]
         ensure_supported_execution_context(context)
             .map_err(|error| FactorizeError::ComputationError(anyhow::Error::new(error)))?;
-        let resident = rank.to_tensor().map_err(|error| {
+        let resident = with_engine(rank.runtime(), Some(context), |engine| {
+            rank.to_tensor(engine)
+        })
+        .map_err(|error| {
             FactorizeError::ComputationError(
                 anyhow::Error::new(error).context("resident RRQR rank materialization failed"),
             )
@@ -7340,11 +7525,13 @@ impl TensorConstructionLike for IdxTensor {
             )
             .into());
         }
-        let concatenated = inners
+        let runtime = inners
             .first()
             .map(|tensor| tensor.runtime())
-            .ok_or_else(|| anyhow::anyhow!("concatenate requires at least one tensor"))?
-            .with_eager_session(|session| session.concatenate(&inners, first_axis))?;
+            .ok_or_else(|| anyhow::anyhow!("concatenate requires at least one tensor"))?;
+        let concatenated = with_eager_session(runtime, None, |session| {
+            session.concatenate(&inners, first_axis)
+        })?;
         let mut indices = first_indices.to_vec();
         indices[first_axis] = new_index;
         Self::from_inner(indices, concatenated).map_err(IdxTensorError::from)
@@ -7815,9 +8002,9 @@ impl IdxTensor {
 
         let packed = self.permute(&perm)?;
         let packed_inner = packed.try_materialized_inner()?;
-        let reshaped = packed_inner
-            .runtime()
-            .with_eager_session(|session| session.reshape(packed_inner, &new_dims))?;
+        let reshaped = with_eager_session(packed_inner.runtime(), None, |session| {
+            session.reshape(packed_inner, &new_dims)
+        })?;
         Self::from_inner(result_indices, reshaped).map_err(IdxTensorError::from)
     }
 
@@ -7906,9 +8093,9 @@ impl IdxTensor {
         packed_dims.extend_from_slice(&old_dims[axis + 1..]);
 
         let inner = self.try_materialized_inner()?;
-        let reshaped = inner
-            .runtime()
-            .with_eager_session(|session| session.reshape(inner, &packed_dims))?;
+        let reshaped = with_eager_session(inner.runtime(), None, |session| {
+            session.reshape(inner, &packed_dims)
+        })?;
         let packed = Self::from_inner(packed_indices, reshaped)?;
         if matches!(order, LinearizationOrder::ColumnMajor) {
             Ok(packed)
@@ -7986,9 +8173,17 @@ impl IdxTensor {
     /// let data = tensor.to_vec::<f64>().unwrap();
     /// assert_eq!(data, &[1.0, 2.0]);
     /// ```
+    ///
+    /// Materialising an eager payload is an implicit entry: it uses the engine
+    /// of the CPU context that owns the payload's eager runtime, falling back to
+    /// the process-global default CPU context when that runtime has no live
+    /// owner (the transitional implicit route).
     pub fn to_vec<T: TensorElement>(&self) -> std::result::Result<Vec<T>, IdxTensorError> {
-        self.as_inner()?
-            .duplicate_value()?
+        let inner = self.as_inner()?;
+        let values = with_engine(inner.runtime(), None, |engine| {
+            inner.duplicate_value(engine)
+        })?;
+        values
             .as_slice::<T>()
             .map(|values| values.to_vec())
             .map_err(|source| IdxTensorError::materialization(anyhow::Error::new(source)))
@@ -8047,7 +8242,9 @@ impl IdxTensor {
         // cases while avoiding a full payload copy for the ordinary
         // host-contiguous path above.
         drop(value);
-        let values = inner.duplicate_value()?;
+        let values = with_engine(inner.runtime(), None, |engine| {
+            inner.duplicate_value(engine)
+        })?;
         let values = values
             .as_slice::<T>()
             .map_err(|source| IdxTensorError::materialization(anyhow::Error::new(source)))?;
@@ -8466,12 +8663,16 @@ impl IdxTensor {
     }
 
     fn decision_values(host: &Self) -> std::result::Result<Vec<f64>, IdxTensorError> {
+        // The readback is already host data (a CPU operand or an explicit
+        // download), so it is read from the host payload directly: materializing
+        // through [`IdxTensor::to_vec`] would enter the implicit engine route for
+        // no numerical work.
         if host.is_f64() {
-            host.to_vec::<f64>().map_err(|error| {
+            host.dense_host_values::<f64>().map_err(|error| {
                 IdxTensorError::operation("decision readback", anyhow::Error::new(error))
             })
         } else if host.is_c64() {
-            host.to_vec::<Complex64>()
+            host.dense_host_values::<Complex64>()
                 .map(|values| values.into_iter().map(|value| value.re).collect())
                 .map_err(|error| {
                     IdxTensorError::operation("decision readback", anyhow::Error::new(error))
@@ -8542,30 +8743,34 @@ impl IdxTensor {
             }
         };
         let scalar = Self::context_scalar_in(operand, factor, context)?;
-        let scaled = operand
-            .runtime()
-            .with_eager_session(|session| session.mul(operand, &scalar))
-            .map_err(|error| {
-                IdxTensorError::operation(
-                    "context-scoped scaling",
-                    anyhow::Error::new(error).context("eager multiplication failed"),
-                )
-            })?;
+        let scaled = with_eager_session(operand.runtime(), Some(context), |session| {
+            session.mul(operand, &scalar)
+        })
+        .map_err(|error| {
+            IdxTensorError::operation(
+                "context-scoped scaling",
+                anyhow::Error::new(error).context("eager multiplication failed"),
+            )
+        })?;
         Self::from_inner(self.indices.clone(), scaled).map_err(IdxTensorError::from)
     }
 
     /// Adopt host storage into a context through explicit construction.
+    ///
+    /// The payload is read from the host storage directly and re-published in
+    /// `context`. Reading it through [`IdxTensor::to_vec`] would borrow the
+    /// implicit engine while this route must stay on the caller's context.
     fn adopt_host_into_context(
         tensor: &Self,
         context: &ExecutionContext,
     ) -> std::result::Result<Self, IdxTensorError> {
         if tensor.is_f64() {
-            let values = tensor.to_vec::<f64>().map_err(|error| {
+            let values = tensor.dense_host_values::<f64>().map_err(|error| {
                 IdxTensorError::operation("context adoption", anyhow::Error::new(error))
             })?;
             Self::from_dense_in(context, tensor.indices.clone(), values)
         } else if tensor.is_c64() {
-            let values = tensor.to_vec::<Complex64>().map_err(|error| {
+            let values = tensor.dense_host_values::<Complex64>().map_err(|error| {
                 IdxTensorError::operation("context adoption", anyhow::Error::new(error))
             })?;
             Self::from_dense_in(context, tensor.indices.clone(), values)
@@ -8668,16 +8873,14 @@ impl IdxTensor {
             let rank = inner.shape().len();
             let axes: Vec<usize> = (0..rank).collect();
             // One eager session on the operand's own runtime, as the other CUDA-only paths in this module do.
-            let scalar = inner
-                .runtime()
-                .with_eager_session(|session| {
-                    let magnitudes = session.abs(inner)?;
-                    let squared = session.reduce_sum_squares(&magnitudes, Some(&axes))?;
-                    session.reshape(&squared, [1])
-                })
-                .map_err(|error| {
-                    IdxTensorError::operation("context-scoped norm", anyhow::anyhow!("{error}"))
-                })?;
+            let scalar = with_eager_session(inner.runtime(), Some(context), |session| {
+                let magnitudes = session.abs(inner)?;
+                let squared = session.reduce_sum_squares(&magnitudes, Some(&axes))?;
+                session.reshape(&squared, [1])
+            })
+            .map_err(|error| {
+                IdxTensorError::operation("context-scoped norm", anyhow::anyhow!("{error}"))
+            })?;
             let values = Self::read_resident_vector(&scalar, 1, context).map_err(|error| {
                 IdxTensorError::operation("context-scoped norm", anyhow::Error::new(error))
             })?;

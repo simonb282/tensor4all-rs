@@ -2,7 +2,7 @@
 //! Tensor storage and linear algebra backend for tensor4all.
 //!
 //! [`CpuExecutionContext`] is the canonical CPU integration path. It requires a
-//! caller-supplied backend and owns plain, graph, and eager-AD runtime state.
+//! caller-supplied [`CpuBackend`] and owns plain, graph, and eager-AD runtime state.
 //!
 //! ## Feature flags
 //!
@@ -63,10 +63,14 @@ pub use backend::{
 };
 #[cfg(feature = "global-defaults")]
 pub use context::{
-    default_cpu_execution_context, default_eager_ctx, with_default_backend, EagerContextError,
+    default_cpu_execution_context, default_eager_ctx, with_default_backend, with_runtime_engine,
+    EagerContextError, ExecutionContextEntryError,
 };
 #[cfg(feature = "explicit-context")]
-pub use context::{CpuExecutionContext, CpuExecutionContextError, ExecutionContext};
+pub use context::{
+    set_default_cpu_threads, AlreadyInitialized, CpuBackend, CpuExecutionContext,
+    CpuExecutionContextError, CpuThreadError, ExecutionContext,
+};
 #[cfg(feature = "tenferro-cuda")]
 pub use cuda::{
     CudaExecutionContext, CudaExecutionContextError, CudaPinnedBuffer, PendingCudaDownload,
@@ -83,9 +87,9 @@ pub use matrix::{
     grouped_mat_mul_shared_with_backend, hermitian_eigendecomposition,
     hermitian_exponential_first_column, lowest_hermitian_eigenpair, mat_mul, mat_mul_in,
     mat_mul_owned, submatrix, submatrix_argmax, swap_cols, swap_rows, transpose, try_from_vec2d,
-    BlasMul, GroupedGemmError, GroupedGemmJob, GroupedGemmOptions, HermitianEigenError,
-    HermitianEigenScalar, HermitianEigendecomposition, HermitianEigenpair, Matrix, MatrixMulError,
-    MatrixScalar, MatrixShapeError, MatrixTensorConversionError,
+    BlasMul, GroupedGemmError, GroupedGemmJob, HermitianEigenError, HermitianEigenScalar,
+    HermitianEigendecomposition, HermitianEigenpair, Matrix, MatrixMulError, MatrixScalar,
+    MatrixShapeError, MatrixTensorConversionError,
 };
 #[cfg(feature = "global-defaults")]
 pub use memory::{release_process_allocator_cached_memory, AllocatorPressureRelief};
@@ -109,23 +113,6 @@ pub use tenferro_bridge::{
     storage_to_native_tensor, sum_native_tensor, svd_native_tensor, tangent_native_tensor,
     BridgeError, NativeTensorReadInput,
 };
-/// The tenferro CPU backend handle that explicit execution contexts and held sessions are built from.
-///
-/// Re-exported so applications build a [`CpuExecutionContext`] or an
-/// [`explicit::HeldSession`] without a direct tenferro dependency; dense tensor and
-/// linear-algebra work stays routed through this crate.
-///
-/// # Examples
-///
-/// ```
-/// use tensor4all_tensorbackend::{CpuBackend, CpuExecutionContext};
-///
-/// let context = CpuExecutionContext::from_backend(CpuBackend::with_threads(1)?);
-/// assert_eq!(context.with_backend(|backend| backend.num_threads()), 1);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[cfg(feature = "explicit-context")]
-pub use tenferro_cpu::CpuBackend;
 #[cfg(feature = "global-defaults")]
 pub use tensor_element::TensorElement;
 
