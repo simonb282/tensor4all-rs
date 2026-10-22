@@ -1,6 +1,8 @@
 //! Column-major layout adapters around context-scoped backend matrix products.
 
-use tensor4all_tensorbackend::{CpuExecutionContext, GroupedGemmJob, Matrix};
+use tensor4all_tensorbackend::{
+    dense_native_tensor_read_input_from_col_major, CpuExecutionContext, Matrix,
+};
 
 use crate::{
     scalar::{component_product_underflows, min_nonzero_component_magnitude},
@@ -237,19 +239,31 @@ pub(crate) fn contract_axis_diag_probe<T: TreeRsiScalar>(
             1,
         )?;
     }
-    // One matrix-vector product per probe label, all in one grouped call.
-    let jobs = (0..k)
-        .map(|batch| {
-            GroupedGemmJob::new(batch * rows, batch * input_batch_len, batch * n, rows, n, 1)
-        })
-        .collect::<Vec<_>>();
-    let mut data = vec![T::zero(); rows * k];
-    context
-        .with_concrete_session(|session| {
-            session.grouped_mat_mul_shared(&input.data, weights, &mut data, &jobs)
-        })
+    // One einsum for every probe label: the input is `rows x n x k` and each
+    // probe label has its own weight column, so the input read `r...,a,l`
+    // against the weight read `a,l` gives `r...,l` for the whole diag-probe
+    // contraction. Both operands are borrowed read views over the existing
+    // buffers and the result buffer is transferred, so the step copies neither
+    // the input nor the weights.
+    let rank = input.dims.len();
+    let contracted_label = rank - 2;
+    let probe_label = rank - 1;
+    let input_ids = (0..rank).collect::<Vec<usize>>();
+    let weight_ids = [contracted_label, probe_label];
+    let mut output_ids = (0..contracted_label).collect::<Vec<usize>>();
+    output_ids.push(probe_label);
+    let input_read = dense_native_tensor_read_input_from_col_major(&input.data, &input.dims)
+        .map_err(TreeRsiError::numerical)?;
+    let weight_read = dense_native_tensor_read_input_from_col_major(weights, &[n, k])
+        .map_err(TreeRsiError::numerical)?;
+    let reads = [input_read.as_read(), weight_read.as_read()];
+    let labels = [input_ids.as_slice(), weight_ids.as_slice()];
+    let contracted = context
+        .with_concrete_session(|session| session.einsum_reads(&reads, &labels, &output_ids))
         .map_err(TreeRsiError::numerical)?
         .map_err(TreeRsiError::numerical)?;
+    let data =
+        T::into_dense_values_from_native_col_major(contracted).map_err(TreeRsiError::numerical)?;
     Ok(Dense { dims, data })
 }
 
@@ -279,3 +293,6 @@ pub(crate) fn mat_mul_cols<T: TreeRsiScalar>(
 ) -> Result<Vec<T>> {
     Ok(gemm(context, matrix(nrows, inner, a)?, matrix(inner, ncols, b)?)?.into_col_major_vec())
 }
+
+#[cfg(test)]
+mod tests;
