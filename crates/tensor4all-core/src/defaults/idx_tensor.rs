@@ -8251,6 +8251,64 @@ impl IdxTensor {
         Ok(read(values))
     }
 
+    /// Run `read` on the logical dense column-major values, borrowing them
+    /// from compact host storage without entering a runtime.
+    ///
+    /// Counterpart of [`Self::dense_host_values`] that does not copy a dense
+    /// host payload. A dense [`IdxTensorStorage::Materialized`] payload is
+    /// borrowed in place, exactly as [`Self::dense_host_values`] reads it
+    /// without a runtime. A non-contiguous or structured payload is
+    /// materialized into a temporary vector, as before. Every other storage
+    /// kind is read through [`Self::with_dense_slice`], which borrows an eager
+    /// host-contiguous payload. Use [`Self::dense_host_values`] when the values
+    /// must outlive the call.
+    ///
+    /// # Arguments
+    ///
+    /// * `read` - A callback that consumes the temporary dense value slice and
+    ///   returns the caller's result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tensor dtype does not match `T` or dense
+    /// materialization fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tensor4all_core::{DynIndex, IdxTensor};
+    ///
+    /// let i = DynIndex::new_dyn(2);
+    /// let tensor = IdxTensor::from_dense(vec![i], vec![1.0_f64, 2.0])?;
+    /// let sum = tensor.with_dense_host_slice::<f64, _>(|values| values.iter().sum::<f64>())?;
+    /// assert_eq!(sum, 3.0);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn with_dense_host_slice<T: tensor4all_tensorbackend::StorageScalar, R>(
+        &self,
+        read: impl FnOnce(&[T]) -> R,
+    ) -> std::result::Result<R, IdxTensorError> {
+        if let IdxTensorStorage::Materialized(storage) = &self.storage {
+            let dims = self.dims();
+            if storage.storage_kind() == StorageKind::Dense {
+                let view = T::payload_view(storage)
+                    .map_err(|error| IdxTensorError::materialization(anyhow::Error::new(error)))?;
+                // INVARIANT: a dense payload has the logical dimensions, so its
+                // contiguous column-major view is the logical dense values; the
+                // length check keeps a mismatch on the validating copy below.
+                if let Some(values) =
+                    view.filter(|values| values.len() == dims.iter().product::<usize>())
+                {
+                    return Ok(read(values));
+                }
+            }
+            let values = T::dense_values(storage, &dims)
+                .map_err(|error| IdxTensorError::materialization(anyhow::Error::new(error)))?;
+            return Ok(read(&values));
+        }
+        self.with_dense_slice::<T, _>(read)
+    }
+
     /// Consume the tensor and return its indices with dense column-major values.
     ///
     /// Use this when a caller needs to move index metadata and dense payload

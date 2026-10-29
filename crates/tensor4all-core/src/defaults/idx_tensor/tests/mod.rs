@@ -782,3 +782,78 @@ fn mixed_dtype_outer_product_gradients_match_finite_differences() {
         &|lhs, rhs| crate::outer_product(lhs, rhs).unwrap(),
     );
 }
+
+fn dense_materialized(data: Vec<f64>, dims: [usize; 2]) -> (IdxTensor, Arc<Storage>) {
+    let storage = Arc::new(Storage::from_dense_col_major(data, &dims).unwrap());
+    let indices = dims.iter().map(|&d| DynIndex::new_dyn(d)).collect();
+    (
+        IdxTensor::from_storage(indices, Arc::clone(&storage)).unwrap(),
+        storage,
+    )
+}
+
+/// A dense `Materialized` payload is borrowed in place and no eager tensor is
+/// built, the property `dense_host_values` has and `with_dense_slice` lacks.
+#[test]
+fn with_dense_host_slice_borrows_a_materialized_payload_without_a_runtime() {
+    let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let (tensor, storage) = dense_materialized(data.clone(), [2, 3]);
+    assert!(matches!(tensor.storage, IdxTensorStorage::Materialized(_)));
+
+    let (borrowed, ptr, len) = tensor
+        .with_dense_host_slice::<f64, _>(|values| (values.to_vec(), values.as_ptr(), values.len()))
+        .unwrap();
+    assert_eq!(borrowed, data);
+    assert_eq!(borrowed, tensor.dense_host_values::<f64>().unwrap());
+    let payload = <f64 as tensor4all_tensorbackend::StorageScalar>::payload_view(&storage)
+        .unwrap()
+        .unwrap();
+    assert_eq!((ptr, len), (payload.as_ptr(), payload.len()));
+    assert!(tensor.eager_cache.get().is_none(), "no runtime entered");
+
+    // The reason for the new method: `with_dense_slice` materializes.
+    tensor.with_dense_slice::<f64, _>(|_| ()).unwrap();
+    assert!(tensor.eager_cache.get().is_some());
+}
+
+#[test]
+fn with_dense_host_slice_matches_dense_host_values_for_every_storage_kind() {
+    // Eager storage.
+    let data = (0..12)
+        .map(|i| Complex64::new(i as f64, -1.0))
+        .collect::<Vec<_>>();
+    let eager = IdxTensor::from_dense(
+        vec![DynIndex::new_dyn(3), DynIndex::new_dyn(4)],
+        data.clone(),
+    )
+    .unwrap();
+    let values = eager
+        .with_dense_host_slice::<Complex64, _>(<[Complex64]>::to_vec)
+        .unwrap();
+    assert_eq!(values, data);
+    assert_eq!(values, eager.dense_host_values::<Complex64>().unwrap());
+
+    // Diagonal `Materialized` storage: logical dense values, not the payload.
+    let diag = IdxTensor::from_storage(
+        vec![DynIndex::new_dyn(2), DynIndex::new_dyn(2)],
+        Arc::new(Storage::from_diag_col_major(vec![1.0_f64, 2.0], 2).unwrap()),
+    )
+    .unwrap();
+    let values = diag
+        .with_dense_host_slice::<f64, _>(<[f64]>::to_vec)
+        .unwrap();
+    assert_eq!(values, vec![1.0, 0.0, 0.0, 2.0]);
+    assert_eq!(values, diag.dense_host_values::<f64>().unwrap());
+}
+
+#[test]
+fn with_dense_host_slice_rejects_a_dtype_mismatch() {
+    let (tensor, _) = dense_materialized(vec![1.0, 2.0], [2, 1]);
+    assert!(tensor
+        .with_dense_host_slice::<Complex64, _>(<[Complex64]>::to_vec)
+        .is_err());
+    let eager = IdxTensor::from_dense(vec![DynIndex::new_dyn(2)], vec![1.0_f64, 2.0]).unwrap();
+    assert!(eager
+        .with_dense_host_slice::<Complex64, _>(<[Complex64]>::to_vec)
+        .is_err());
+}
