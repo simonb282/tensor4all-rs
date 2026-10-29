@@ -171,6 +171,11 @@ PERFORMANCE_SECTIONS = (
     "Full Quantics Grid Sweeps",
     "Per-Call Reconstruction Inside Loops",
     "Owned Vector Cache Keys",
+    "Std Hasher On Integer Keys Of A Per-Point Map",
+    "Cache Key Rebuilt Per Request",
+    "Owned Copy Of A Dense Payload On A Per-Call Path",
+    "Input Validation Repeated Per Pass",
+    "Batch Entry Point Driven One Point At A Time",
     "Silent Slow-Path Fallback",
     "Unpinned Timing Claims",
 )
