@@ -2846,23 +2846,25 @@ where
         // Column-major: stride of axis k is the product of the dims before it.
         let strides = [1usize, dims[0]];
 
-        let raw = tensor.dense_host_values::<f64>()?;
-        let mut out = Vec::with_capacity(parent_dim * points.len());
-        for &point in points {
-            let physical_value = value_at(
-                values,
-                entry.input_position,
-                point,
-                "TreeTNCachedEvaluator::try_compute_leaf_message_raw",
-            )?;
-            for parent_value in 0..parent_dim {
-                let mut axis_values = [0usize; 2];
-                axis_values[physical_axis] = physical_value;
-                axis_values[parent_axis] = parent_value;
-                let flat = axis_values[0] * strides[0] + axis_values[1] * strides[1];
-                out.push(raw[flat]);
+        let out = with_host_values::<f64, _>(tensor, |raw| {
+            let mut out = Vec::with_capacity(parent_dim * points.len());
+            for &point in points {
+                let physical_value = value_at(
+                    values,
+                    entry.input_position,
+                    point,
+                    "TreeTNCachedEvaluator::try_compute_leaf_message_raw",
+                )?;
+                for parent_value in 0..parent_dim {
+                    let mut axis_values = [0usize; 2];
+                    axis_values[physical_axis] = physical_value;
+                    axis_values[parent_axis] = parent_value;
+                    let flat = axis_values[0] * strides[0] + axis_values[1] * strides[1];
+                    out.push(raw[flat]);
+                }
             }
-        }
+            Ok(out)
+        })?;
         Ok(Some(out))
     }
 
@@ -2908,23 +2910,25 @@ where
         let dims = tensor.dims();
         let parent_dim = dims[parent_axis];
         let strides = [1usize, dims[0]];
-        let raw = tensor.dense_host_values::<Complex64>()?;
-        let mut out = Vec::with_capacity(parent_dim * points.len());
-        for &point in points {
-            let physical_value = value_at(
-                values,
-                entry.input_position,
-                point,
-                "TreeTNCachedEvaluator::try_compute_leaf_message_complex_raw",
-            )?;
-            for parent_value in 0..parent_dim {
-                let mut axis_values = [0usize; 2];
-                axis_values[physical_axis] = physical_value;
-                axis_values[parent_axis] = parent_value;
-                let flat = axis_values[0] * strides[0] + axis_values[1] * strides[1];
-                out.push(raw[flat]);
+        let out = with_host_values::<Complex64, _>(tensor, |raw| {
+            let mut out = Vec::with_capacity(parent_dim * points.len());
+            for &point in points {
+                let physical_value = value_at(
+                    values,
+                    entry.input_position,
+                    point,
+                    "TreeTNCachedEvaluator::try_compute_leaf_message_complex_raw",
+                )?;
+                for parent_value in 0..parent_dim {
+                    let mut axis_values = [0usize; 2];
+                    axis_values[physical_axis] = physical_value;
+                    axis_values[parent_axis] = parent_value;
+                    let flat = axis_values[0] * strides[0] + axis_values[1] * strides[1];
+                    out.push(raw[flat]);
+                }
             }
-        }
+            Ok(out)
+        })?;
         Ok(Some(out))
     }
 
@@ -3828,14 +3832,15 @@ where
             physical_values.push(physical_value);
         }
         let child_columns = child_values;
-        let raw = tensor.dense_host_values::<f64>()?;
-        let result = Self::grouped_chain_message_contraction(
-            route,
-            spec,
-            &raw,
-            &physical_values,
-            &child_columns,
-        )?;
+        let result = with_host_values::<f64, _>(tensor, |raw| {
+            Self::grouped_chain_message_contraction(
+                route,
+                spec,
+                raw,
+                &physical_values,
+                &child_columns,
+            )
+        })?;
         Ok(Some(result))
     }
 
@@ -3957,14 +3962,15 @@ where
             physical_values.push(physical_value);
         }
         let child_columns = child_values;
-        let raw = tensor.dense_host_values::<Complex64>()?;
-        let result = Self::grouped_chain_message_contraction(
-            route,
-            spec,
-            &raw,
-            &physical_values,
-            &child_columns,
-        )?;
+        let result = with_host_values::<Complex64, _>(tensor, |raw| {
+            Self::grouped_chain_message_contraction(
+                route,
+                spec,
+                raw,
+                &physical_values,
+                &child_columns,
+            )
+        })?;
         Ok(Some(result))
     }
 
@@ -4153,21 +4159,22 @@ where
             );
         }
         let cache = &mut self.prepared_branch_slices_f64;
-        let raw = tensor.dense_host_values::<f64>()?;
-        let result = Self::grouped_branch_message_contraction_cached(
-            route,
-            cache,
-            node,
-            &parent,
-            ScalarKind::F64,
-            BranchMessageBatch {
-                spec,
-                raw: &raw,
-                physical_values: &physical_values,
-                child1_columns: &child_1_columns,
-                child2_columns: &child_2_columns,
-            },
-        )?;
+        let result = with_host_values::<f64, _>(tensor, |raw| {
+            Self::grouped_branch_message_contraction_cached(
+                route,
+                cache,
+                node,
+                &parent,
+                ScalarKind::F64,
+                BranchMessageBatch {
+                    spec,
+                    raw,
+                    physical_values: &physical_values,
+                    child1_columns: &child_1_columns,
+                    child2_columns: &child_2_columns,
+                },
+            )
+        })?;
         Ok(Some(result))
     }
 
@@ -4349,21 +4356,22 @@ where
             );
         }
         let cache = &mut self.prepared_branch_slices_c64;
-        let raw = tensor.dense_host_values::<Complex64>()?;
-        let result = Self::grouped_branch_message_contraction_cached(
-            route,
-            cache,
-            node,
-            &parent,
-            ScalarKind::C64,
-            BranchMessageBatch {
-                spec,
-                raw: &raw,
-                physical_values: &physical_values,
-                child1_columns: &child_1_columns,
-                child2_columns: &child_2_columns,
-            },
-        )?;
+        let result = with_host_values::<Complex64, _>(tensor, |raw| {
+            Self::grouped_branch_message_contraction_cached(
+                route,
+                cache,
+                node,
+                &parent,
+                ScalarKind::C64,
+                BranchMessageBatch {
+                    spec,
+                    raw,
+                    physical_values: &physical_values,
+                    child1_columns: &child_1_columns,
+                    child2_columns: &child_2_columns,
+                },
+            )
+        })?;
         Ok(Some(result))
     }
 
@@ -4524,9 +4532,9 @@ where
             )?);
         }
 
-        let raw = tensor.dense_host_values::<T>()?;
-        let result =
-            multi_branch_message_contraction(route, &spec, &raw, &physical_values, &child_columns)?;
+        let result = with_host_values::<T, _>(tensor, |raw| {
+            multi_branch_message_contraction(route, &spec, raw, &physical_values, &child_columns)
+        })?;
         Ok(Some(result))
     }
 
@@ -5127,74 +5135,80 @@ where
             ScalarKind::F32 | ScalarKind::C32 => return Ok(None),
             ScalarKind::F64 => {}
             ScalarKind::C64 => {
-                let center_raw = center_tensor.dense_host_values::<Complex64>()?;
-                let mut result = Vec::with_capacity(n_points);
-                for point in 0..n_points {
-                    let physical_value = value_at(
-                        values,
-                        entry.input_position,
-                        point,
-                        "TreeTNCachedEvaluator::try_contract_leaf_center_from_raw",
-                    )?;
-                    let assignment = component
-                        .point_to_assignment
-                        .get(point)
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("missing centre assignment for point {point}")
-                        })?;
-                    ensure!(
+                return with_host_values::<Complex64, _>(center_tensor, |center_raw| {
+                    let mut result = Vec::with_capacity(n_points);
+                    for point in 0..n_points {
+                        let physical_value = value_at(
+                            values,
+                            entry.input_position,
+                            point,
+                            "TreeTNCachedEvaluator::try_contract_leaf_center_from_raw",
+                        )?;
+                        let assignment = component
+                            .point_to_assignment
+                            .get(point)
+                            .copied()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing centre assignment for point {point}")
+                            })?;
+                        ensure!(
                         assignment < assignment_dim,
                         "centre assignment {assignment} is out of bounds for dimension {assignment_dim}"
                     );
-                    let mut sum = Complex64::new(0.0, 0.0);
-                    for bond in 0..bond_dim {
-                        let center_offset = physical_value * center_strides[physical_axis]
-                            + bond * center_strides[bond_axis];
-                        let environment_offset = assignment * bond_dim + bond;
-                        let CachedScalar::C64(environment_value) = raw_values[environment_offset]
-                        else {
-                            return Ok(None);
-                        };
-                        sum += center_raw[center_offset] * environment_value;
+                        let mut sum = Complex64::new(0.0, 0.0);
+                        for bond in 0..bond_dim {
+                            let center_offset = physical_value * center_strides[physical_axis]
+                                + bond * center_strides[bond_axis];
+                            let environment_offset = assignment * bond_dim + bond;
+                            let CachedScalar::C64(environment_value) =
+                                raw_values[environment_offset]
+                            else {
+                                return Ok(None);
+                            };
+                            sum += center_raw[center_offset] * environment_value;
+                        }
+                        result.push(CachedScalar::C64(sum));
                     }
-                    result.push(CachedScalar::C64(sum));
-                }
-                return Ok(Some(result));
+                    Ok(Some(result))
+                });
             }
         }
 
-        let center_raw = center_tensor.dense_host_values::<f64>()?;
-        let mut result = Vec::with_capacity(n_points);
-        for point in 0..n_points {
-            let physical_value = value_at(
-                values,
-                entry.input_position,
-                point,
-                "TreeTNCachedEvaluator::try_contract_leaf_center_from_raw",
-            )?;
-            let assignment = component
-                .point_to_assignment
-                .get(point)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("missing centre assignment for point {point}"))?;
-            ensure!(
+        with_host_values::<f64, _>(center_tensor, |center_raw| {
+            let mut result = Vec::with_capacity(n_points);
+            for point in 0..n_points {
+                let physical_value = value_at(
+                    values,
+                    entry.input_position,
+                    point,
+                    "TreeTNCachedEvaluator::try_contract_leaf_center_from_raw",
+                )?;
+                let assignment = component
+                    .point_to_assignment
+                    .get(point)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("missing centre assignment for point {point}")
+                    })?;
+                ensure!(
                 assignment < assignment_dim,
                 "centre assignment {assignment} is out of bounds for dimension {assignment_dim}"
             );
-            let mut sum = 0.0;
-            for bond in 0..bond_dim {
-                let center_offset = physical_value * center_strides[physical_axis]
-                    + bond * center_strides[bond_axis];
-                let environment_offset = assignment * bond_dim + bond;
-                let CachedScalar::F64(environment_value) = raw_values[environment_offset] else {
-                    return Ok(None);
-                };
-                sum += center_raw[center_offset] * environment_value;
+                let mut sum = 0.0;
+                for bond in 0..bond_dim {
+                    let center_offset = physical_value * center_strides[physical_axis]
+                        + bond * center_strides[bond_axis];
+                    let environment_offset = assignment * bond_dim + bond;
+                    let CachedScalar::F64(environment_value) = raw_values[environment_offset]
+                    else {
+                        return Ok(None);
+                    };
+                    sum += center_raw[center_offset] * environment_value;
+                }
+                result.push(CachedScalar::F64(sum));
             }
-            result.push(CachedScalar::F64(sum));
-        }
-        Ok(Some(result))
+            Ok(Some(result))
+        })
     }
 
     /// Evaluates a one-component centre on a path without constructing a
@@ -5271,8 +5285,47 @@ where
             ScalarKind::F32 | ScalarKind::C32 => return Ok(None),
             ScalarKind::F64 => {}
             ScalarKind::C64 => {
-                let center_raw = center_tensor.dense_host_values::<Complex64>()?;
-                let environment_raw = environment_tensor.dense_host_values::<Complex64>()?;
+                return with_host_values::<Complex64, _>(center_tensor, |center_raw| {
+                    with_host_values::<Complex64, _>(environment_tensor, |environment_raw| {
+                        let mut result = Vec::with_capacity(n_points);
+                        for point in 0..n_points {
+                            let physical_value = value_at(
+                                values,
+                                physical_position,
+                                point,
+                                "TreeTNCachedEvaluator::try_contract_leaf_center_raw",
+                            )?;
+                            let assignment = component
+                                .point_to_assignment
+                                .get(point)
+                                .copied()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("missing centre assignment for point {point}")
+                                })?;
+                            ensure!(
+                        assignment < assignment_dim,
+                        "centre assignment {assignment} is out of bounds for dimension {assignment_dim}"
+                    );
+                            let mut sum = Complex64::new(0.0, 0.0);
+                            for bond in 0..bond_dim {
+                                let center_offset = physical_value * center_strides[physical_axis]
+                                    + bond * center_strides[bond_axis];
+                                let environment_offset = bond
+                                    * environment_strides[environment_bond_axis]
+                                    + assignment * environment_strides[assignment_axis];
+                                sum +=
+                                    center_raw[center_offset] * environment_raw[environment_offset];
+                            }
+                            result.push(CachedScalar::C64(sum));
+                        }
+                        Ok(Some(result))
+                    })
+                });
+            }
+        }
+
+        with_host_values::<f64, _>(center_tensor, |center_raw| {
+            with_host_values::<f64, _>(environment_tensor, |environment_raw| {
                 let mut result = Vec::with_capacity(n_points);
                 for point in 0..n_points {
                     let physical_value = value_at(
@@ -5289,10 +5342,10 @@ where
                             anyhow::anyhow!("missing centre assignment for point {point}")
                         })?;
                     ensure!(
-                        assignment < assignment_dim,
-                        "centre assignment {assignment} is out of bounds for dimension {assignment_dim}"
-                    );
-                    let mut sum = Complex64::new(0.0, 0.0);
+                assignment < assignment_dim,
+                "centre assignment {assignment} is out of bounds for dimension {assignment_dim}"
+            );
+                    let mut sum = 0.0;
                     for bond in 0..bond_dim {
                         let center_offset = physical_value * center_strides[physical_axis]
                             + bond * center_strides[bond_axis];
@@ -5300,42 +5353,11 @@ where
                             + assignment * environment_strides[assignment_axis];
                         sum += center_raw[center_offset] * environment_raw[environment_offset];
                     }
-                    result.push(CachedScalar::C64(sum));
+                    result.push(CachedScalar::F64(sum));
                 }
-                return Ok(Some(result));
-            }
-        }
-
-        let center_raw = center_tensor.dense_host_values::<f64>()?;
-        let environment_raw = environment_tensor.dense_host_values::<f64>()?;
-        let mut result = Vec::with_capacity(n_points);
-        for point in 0..n_points {
-            let physical_value = value_at(
-                values,
-                physical_position,
-                point,
-                "TreeTNCachedEvaluator::try_contract_leaf_center_raw",
-            )?;
-            let assignment = component
-                .point_to_assignment
-                .get(point)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("missing centre assignment for point {point}"))?;
-            ensure!(
-                assignment < assignment_dim,
-                "centre assignment {assignment} is out of bounds for dimension {assignment_dim}"
-            );
-            let mut sum = 0.0;
-            for bond in 0..bond_dim {
-                let center_offset = physical_value * center_strides[physical_axis]
-                    + bond * center_strides[bond_axis];
-                let environment_offset = bond * environment_strides[environment_bond_axis]
-                    + assignment * environment_strides[assignment_axis];
-                sum += center_raw[center_offset] * environment_raw[environment_offset];
-            }
-            result.push(CachedScalar::F64(sum));
-        }
-        Ok(Some(result))
+                Ok(Some(result))
+            })
+        })
     }
 
     /// Contracts a degree-2 or degree-3 center directly from raw core and
@@ -5403,14 +5425,15 @@ where
                 else {
                     return Ok(None);
                 };
-                let core = center_tensor.dense_host_values::<Complex64>()?;
-                let result = contract_raw_center(
-                    &core,
-                    &center_tensor.dims(),
-                    physical_axis,
-                    &physical_values,
-                    &components,
-                )?;
+                let result = with_host_values::<Complex64, _>(center_tensor, |core| {
+                    contract_raw_center(
+                        core,
+                        &center_tensor.dims(),
+                        physical_axis,
+                        &physical_values,
+                        &components,
+                    )
+                })?;
                 return Ok(Some(result.into_iter().map(CachedScalar::C64).collect()));
             }
         }
@@ -5427,14 +5450,15 @@ where
         else {
             return Ok(None);
         };
-        let core = center_tensor.dense_host_values::<f64>()?;
-        let result = contract_raw_center(
-            &core,
-            &center_tensor.dims(),
-            physical_axis,
-            &physical_values,
-            &components,
-        )?;
+        let result = with_host_values::<f64, _>(center_tensor, |core| {
+            contract_raw_center(
+                core,
+                &center_tensor.dims(),
+                physical_axis,
+                &physical_values,
+                &components,
+            )
+        })?;
         Ok(Some(result.into_iter().map(CachedScalar::F64).collect()))
     }
 
@@ -7004,7 +7028,7 @@ fn tensor_scalar_kind(tensor: &IdxTensor) -> Result<ScalarKind> {
 ///
 /// Raw cached messages still need enum decoding, but the decoding is limited
 /// to the requested columns. An `IdxTensor` message reads its compact host
-/// payload through `dense_host_values`, so a session route does not enter the
+/// payload through `with_dense_host_slice`, so a session route does not enter the
 /// process-global eager runtime for a read.
 fn gather_message_columns<T>(
     message: &StackedMessage,
@@ -7049,29 +7073,30 @@ where
     let Some(tensor) = message.tensor.as_ref() else {
         return Ok(None);
     };
-    let raw_values = tensor.dense_host_values::<T>()?;
-    let mut columns = Vec::with_capacity(child_dim * points.len());
-    for &point in points {
-        let assignment = assignment_batch
-            .point_to_assignment
-            .get(point)
-            .copied()
-            .ok_or_else(|| {
-                anyhow::anyhow!("{context}: missing child assignment for point {point}")
+    with_host_values::<T, _>(tensor, |raw_values| {
+        let mut columns = Vec::with_capacity(child_dim * points.len());
+        for &point in points {
+            let assignment = assignment_batch
+                .point_to_assignment
+                .get(point)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{context}: missing child assignment for point {point}")
+                })?;
+            let start = assignment.checked_mul(child_dim).ok_or_else(|| {
+                anyhow::anyhow!("{context}: child assignment offset overflows usize")
             })?;
-        let start = assignment
-            .checked_mul(child_dim)
-            .ok_or_else(|| anyhow::anyhow!("{context}: child assignment offset overflows usize"))?;
-        let end = start
-            .checked_add(child_dim)
-            .ok_or_else(|| anyhow::anyhow!("{context}: child assignment end overflows usize"))?;
-        columns.extend_from_slice(
-            raw_values
-                .get(start..end)
-                .ok_or_else(|| anyhow::anyhow!("{context}: child assignment is out of bounds"))?,
-        );
-    }
-    Ok(Some(columns))
+            let end = start.checked_add(child_dim).ok_or_else(|| {
+                anyhow::anyhow!("{context}: child assignment end overflows usize")
+            })?;
+            columns.extend_from_slice(
+                raw_values.get(start..end).ok_or_else(|| {
+                    anyhow::anyhow!("{context}: child assignment is out of bounds")
+                })?,
+            );
+        }
+        Ok(Some(columns))
+    })
 }
 
 fn slice_tensor(
@@ -7094,26 +7119,45 @@ fn slice_tensor(
     route.select_indices(tensor, &selected_indices, &positions)
 }
 
+/// Runs `read` on the dense host values of `tensor` without copying them.
+///
+/// A read-only path borrows the payload through
+/// [`IdxTensor::with_dense_host_slice`], which, like `dense_host_values`, does
+/// not enter a runtime for compact host storage. A path that keeps the values
+/// beyond the call uses `dense_host_values`.
+fn with_host_values<T, R>(tensor: &IdxTensor, read: impl FnOnce(&[T]) -> Result<R>) -> Result<R>
+where
+    T: StorageScalar,
+{
+    tensor
+        .with_dense_host_slice::<T, _>(read)
+        .map_err(anyhow::Error::from)?
+}
+
 fn tensor_values_any(tensor: &IdxTensor) -> Result<Vec<AnyScalar>> {
     if tensor.is_f32() {
         tensor
-            .dense_host_values::<f32>()
-            .map(|values| values.into_iter().map(AnyScalar::from_value).collect())
+            .with_dense_host_slice::<f32, _>(|values| {
+                values.iter().copied().map(AnyScalar::from_value).collect()
+            })
             .map_err(anyhow::Error::from)
     } else if tensor.is_f64() {
         tensor
-            .dense_host_values::<f64>()
-            .map(|values| values.into_iter().map(AnyScalar::from_value).collect())
+            .with_dense_host_slice::<f64, _>(|values| {
+                values.iter().copied().map(AnyScalar::from_value).collect()
+            })
             .map_err(anyhow::Error::from)
     } else if tensor.is_c32() {
         tensor
-            .dense_host_values::<Complex32>()
-            .map(|values| values.into_iter().map(AnyScalar::from_value).collect())
+            .with_dense_host_slice::<Complex32, _>(|values| {
+                values.iter().copied().map(AnyScalar::from_value).collect()
+            })
             .map_err(anyhow::Error::from)
     } else if tensor.is_c64() {
         tensor
-            .dense_host_values::<Complex64>()
-            .map(|values| values.into_iter().map(AnyScalar::from_value).collect())
+            .with_dense_host_slice::<Complex64, _>(|values| {
+                values.iter().copied().map(AnyScalar::from_value).collect()
+            })
             .map_err(anyhow::Error::from)
     } else {
         bail!(
@@ -7227,23 +7271,27 @@ fn ensure_typed_message_storage_shape<T>(
 fn tensor_values_cached(tensor: &IdxTensor) -> Result<Vec<CachedScalar>> {
     if tensor.is_f32() {
         tensor
-            .dense_host_values::<f32>()
-            .map(|values| values.into_iter().map(CachedScalar::F32).collect())
+            .with_dense_host_slice::<f32, _>(|values| {
+                values.iter().copied().map(CachedScalar::F32).collect()
+            })
             .map_err(anyhow::Error::from)
     } else if tensor.is_f64() {
         tensor
-            .dense_host_values::<f64>()
-            .map(|values| values.into_iter().map(CachedScalar::F64).collect())
+            .with_dense_host_slice::<f64, _>(|values| {
+                values.iter().copied().map(CachedScalar::F64).collect()
+            })
             .map_err(anyhow::Error::from)
     } else if tensor.is_c32() {
         tensor
-            .dense_host_values::<Complex32>()
-            .map(|values| values.into_iter().map(CachedScalar::C32).collect())
+            .with_dense_host_slice::<Complex32, _>(|values| {
+                values.iter().copied().map(CachedScalar::C32).collect()
+            })
             .map_err(anyhow::Error::from)
     } else if tensor.is_c64() {
         tensor
-            .dense_host_values::<Complex64>()
-            .map(|values| values.into_iter().map(CachedScalar::C64).collect())
+            .with_dense_host_slice::<Complex64, _>(|values| {
+                values.iter().copied().map(CachedScalar::C64).collect()
+            })
             .map_err(anyhow::Error::from)
     } else {
         bail!(
