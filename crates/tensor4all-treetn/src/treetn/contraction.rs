@@ -2305,6 +2305,9 @@ pub struct ContractionOptions {
     pub mismatched_topology_dense_limit: Option<usize>,
     /// SRC-specific rank, tolerance, probe, and finalization controls.
     pub src_options: SrcOptions,
+    /// Fit only: bond cap of the zip-up start (see [`FitContractionOptions::initial_max_bond_dim`]); `None`
+    /// (default) uses `max_bond_dim`. Other methods ignore it, but every entry point rejects `0`.
+    pub initial_max_bond_dim: Option<usize>,
 }
 
 impl Default for ContractionOptions {
@@ -2320,6 +2323,7 @@ impl Default for ContractionOptions {
             dense_reference_limit: None,
             mismatched_topology_dense_limit: None,
             src_options: SrcOptions::default(),
+            initial_max_bond_dim: None,
         }
     }
 }
@@ -2380,6 +2384,28 @@ impl ContractionOptions {
     /// or opposite-side support than this bound.
     pub fn with_max_bond_dim(mut self, max_bond_dim: usize) -> Self {
         self.max_bond_dim = Some(max_bond_dim);
+        self
+    }
+
+    /// Fit only: cap the bond dimension of the zip-up start (see [`Self::initial_max_bond_dim`]); `0` is rejected
+    /// when the contraction runs. The sweeps grow the bonds beyond the start only as far as `svd_policy` or
+    /// `max_bond_dim` allows; without either they keep the start's bond dimensions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tensor4all_core::SvdTruncationPolicy;
+    /// use tensor4all_treetn::contraction::ContractionOptions;
+    ///
+    /// // A cheap start of bond dimension 16; the tolerance lets the sweep grow the bonds beyond it.
+    /// let options = ContractionOptions::fit()
+    ///     .with_svd_policy(SvdTruncationPolicy::new(1e-10))
+    ///     .with_initial_max_bond_dim(16);
+    /// assert_eq!(options.initial_max_bond_dim, Some(16));
+    /// assert_eq!(options.max_bond_dim, None);
+    /// ```
+    pub fn with_initial_max_bond_dim(mut self, max_bond_dim: usize) -> Self {
+        self.initial_max_bond_dim = Some(max_bond_dim);
         self
     }
 
@@ -2542,9 +2568,11 @@ where
 /// [`contract_in`]): invalid truncation options or an invalid SRC
 /// configuration are rejected on every method, including the single-node and
 /// zero-sweep short-cuts, so the sibling entries cannot drift.
-fn validate_contract_options(options: &ContractionOptions) -> Result<()> {
+pub(crate) fn validate_contract_options(options: &ContractionOptions) -> Result<()> {
     validate_svd_truncation_options(options.max_bond_dim, options.svd_policy)
         .context("invalid contraction options")?;
+    validate_svd_truncation_options(options.initial_max_bond_dim, None)
+        .context("invalid contraction options: initial_max_bond_dim")?;
     if options.method == ContractionMethod::Src {
         options
             .src_options
@@ -2569,6 +2597,9 @@ fn fit_options_from(options: &ContractionOptions) -> FitContractionOptions {
     }
     if let Some(tol) = options.convergence_tol {
         fit_options = fit_options.with_convergence_tol(tol);
+    }
+    if let Some(start) = options.initial_max_bond_dim {
+        fit_options = fit_options.with_initial_max_bond_dim(start);
     }
     fit_options
 }
@@ -2761,6 +2792,8 @@ where
     }
     validate_svd_truncation_options(options.max_bond_dim, options.svd_policy)
         .context("contract_src_with_rng: invalid contraction options")?;
+    validate_svd_truncation_options(options.initial_max_bond_dim, None)
+        .context("contract_src_with_rng: invalid initial_max_bond_dim")?;
     options
         .src_options
         .validate(options.max_bond_dim)
@@ -2853,6 +2886,8 @@ where
     }
     validate_svd_truncation_options(options.max_bond_dim, options.svd_policy)
         .context("contract_src_with_rng_in: invalid contraction options")?;
+    validate_svd_truncation_options(options.initial_max_bond_dim, None)
+        .context("contract_src_with_rng_in: invalid initial_max_bond_dim")?;
     options
         .src_options
         .validate(options.max_bond_dim)

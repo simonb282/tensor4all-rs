@@ -415,6 +415,11 @@ fn test_fit_contraction_options_builders() {
     assert_eq!(opts.svd_policy, Some(SvdTruncationPolicy::new(1e-8)));
     assert_eq!(opts.factorize_alg, FactorizeAlg::LU);
     assert_eq!(opts.convergence_tol, Some(1e-6));
+    assert!(opts.initial_max_bond_dim.is_none());
+    assert_eq!(
+        opts.with_initial_max_bond_dim(4).initial_max_bond_dim,
+        Some(4)
+    );
 }
 
 // ========================================================================

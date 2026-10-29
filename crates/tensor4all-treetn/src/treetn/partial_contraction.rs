@@ -856,6 +856,8 @@ where
     V: Clone + Hash + Eq + Send + Sync + Debug + Ord,
     <DynIndex as IndexLike>::Id: Clone + Hash + Eq + Ord + Debug + Send + Sync,
 {
+    // before any preparation, so that no fallback path can skip the option checks
+    super::contraction::validate_contract_options(&options)?;
     validate_partial_contraction_spec(a, b, spec)?;
 
     let (mut a_modified, mut b_modified, restore_from, restore_to) =

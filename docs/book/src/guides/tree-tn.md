@@ -259,6 +259,12 @@ Concretely:
 When interoperating with code that uses `nhalfsweeps`, divide by two before passing the value to
 `tensor4all-treetn` APIs.
 
+A fit contraction starts its sweeps from a zip-up of the two inputs. With large bond dimensions that start can
+dominate the time and memory; `ContractionOptions::with_initial_max_bond_dim(k)` (or the same method on
+`FitOptions`) caps it at bond dimension `k`. The sweeps then grow the bonds as far as `svd_policy` or
+`max_bond_dim` allows; with neither set they keep the start's bond dimensions. With a single sweep, `k` has to be
+large enough for the requested accuracy.
+
 ## Experimental sketched products
 
 For Hadamard products of existing compatible trees, see the

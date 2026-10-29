@@ -1432,6 +1432,15 @@ pub struct FitContractionOptions {
     /// be finite and non-negative; fitting stops when the relative change in
     /// the network norm is below `tol`.
     pub convergence_tol: Option<f64>,
+    /// Bond cap of the zip-up result the sweeps start from; `None` (default) uses `max_bond_dim`.
+    ///
+    /// A small cap (for example 8 to 16) makes the start cheap: the zip-up then never forms large bonds. The sweeps
+    /// grow the bonds beyond the start only as far as `svd_policy` (or `qr_rtol`) or `max_bond_dim` allows; with
+    /// neither set they keep the start's bond dimensions. With few sweeps the cap must be large enough for the
+    /// requested accuracy. The cap never exceeds `max_bond_dim`. Only used when the fit builds its
+    /// own start ([`contract_fit`], [`contract_fit_in`]); [`contract_fit_from_initial`] and [`fit_sum`] take the
+    /// start from the caller.
+    pub initial_max_bond_dim: Option<usize>,
 }
 
 impl Default for FitContractionOptions {
@@ -1443,6 +1452,7 @@ impl Default for FitContractionOptions {
             qr_rtol: None,
             factorize_alg: FactorizeAlg::SVD,
             convergence_tol: None,
+            initial_max_bond_dim: None,
         }
     }
 }
@@ -1484,6 +1494,36 @@ impl FitContractionOptions {
     pub fn with_convergence_tol(mut self, tol: f64) -> Self {
         self.convergence_tol = Some(tol);
         self
+    }
+
+    /// Cap the bond dimension of the zip-up start (see [`Self::initial_max_bond_dim`]); `0` is rejected when the
+    /// contraction runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tensor4all_core::SvdTruncationPolicy;
+    /// use tensor4all_treetn::FitOptions;
+    ///
+    /// // A cheap start of bond dimension 16; the tolerance lets the sweep grow the bonds up to 512.
+    /// let options = FitOptions::new(1)
+    ///     .with_svd_policy(SvdTruncationPolicy::new(1e-10))
+    ///     .with_max_bond_dim(512)
+    ///     .with_initial_max_bond_dim(16);
+    /// assert_eq!(options.initial_max_bond_dim, Some(16));
+    /// assert_eq!(options.max_bond_dim, Some(512));
+    /// ```
+    pub fn with_initial_max_bond_dim(mut self, max_bond_dim: usize) -> Self {
+        self.initial_max_bond_dim = Some(max_bond_dim);
+        self
+    }
+
+    /// The bond cap of the zip-up start: `initial_max_bond_dim`, never above `max_bond_dim`.
+    fn start_max_bond_dim(&self) -> Option<usize> {
+        match (self.initial_max_bond_dim, self.max_bond_dim) {
+            (Some(start), Some(max)) => Some(start.min(max)),
+            (start, max) => start.or(max),
+        }
     }
 }
 
@@ -1806,6 +1846,10 @@ where
         );
     }
 
+    if options.initial_max_bond_dim == Some(0) {
+        return Err(anyhow::anyhow!("fit: initial_max_bond_dim must be at least 1").into());
+    }
+
     // Initialize C using the SVD-based zipup contraction while preserving
     // the input topology required by variational sweeps.
     let zipup_started = profile_enabled.then(Instant::now);
@@ -1814,7 +1858,7 @@ where
         center,
         CanonicalForm::Unitary,
         options.svd_policy,
-        options.max_bond_dim,
+        options.start_max_bond_dim(),
         leaves.as_ref(),
     )?;
     if let Some(zipup_started) = zipup_started {
