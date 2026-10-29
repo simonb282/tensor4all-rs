@@ -472,6 +472,41 @@ fn factor_extraction_rejects_non_finite_factors() {
     }
 }
 
+/// The factor outputs are accepted and rejected exactly as by the exact
+/// `abs_val().is_finite()` test: `|z|^2` may overflow while `|z|` is finite.
+#[test]
+fn factor_extraction_decisions_match_the_exact_magnitude_test() {
+    let cases = [
+        (Complex64::new(f64::NAN, 0.0), false),
+        (Complex64::new(0.0, f64::NAN), false),
+        (Complex64::new(f64::INFINITY, 0.0), false),
+        (Complex64::new(0.0, f64::NEG_INFINITY), false),
+        // Both components finite, but |z| overflows.
+        (Complex64::new(1.5e308, 1.5e308), false),
+        (Complex64::new(f64::MAX, f64::MAX), false),
+        // |z|^2 overflows, |z| is finite.
+        (Complex64::new(1e308, 1e308), true),
+        (Complex64::new(f64::MAX, 0.0), true),
+        (Complex64::new(0.0, -f64::MAX), true),
+        (Complex64::new(1e200, 1e200), true),
+    ];
+    for (z, accepted) in cases {
+        assert_eq!(accepted, z.abs_val().is_finite(), "{z:?}");
+        for left_orthogonal in [false, true] {
+            // 1x1, rank 1: the factor that is not forced to one carries `z`.
+            let result = super::extract_lu_from_factorized(&[z], 1, 1, 1, left_orthogonal);
+            assert_eq!(result.is_ok(), accepted, "{z:?}");
+            if !accepted {
+                let expected = if left_orthogonal { "U" } else { "L" };
+                assert!(matches!(
+                    result.unwrap_err(),
+                    crate::MatrixCIError::NaNEncountered { matrix } if matrix == expected
+                ));
+            }
+        }
+    }
+}
+
 /// The selection-only path must reproduce the full factorization's pivots and
 /// error history exactly, including the rank-cap residual and a zero cap.
 #[test]

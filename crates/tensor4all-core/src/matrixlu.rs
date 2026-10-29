@@ -771,7 +771,7 @@ fn extract_l_from_factorized<T: Scalar>(
         }
     }
 
-    if l_data.iter().any(|&value| !value.abs_val().is_finite()) {
+    if !all_magnitudes_finite(&l_data) {
         return Err(MatrixCIError::NaNEncountered {
             matrix: "L".to_string(),
         });
@@ -807,7 +807,7 @@ fn extract_u_from_factorized<T: Scalar>(
         }
     }
 
-    if u_data.iter().any(|&value| !value.abs_val().is_finite()) {
+    if !all_magnitudes_finite(&u_data) {
         return Err(MatrixCIError::NaNEncountered {
             matrix: "U".to_string(),
         });
