@@ -39,6 +39,7 @@ tenferro-provider-inject = [
 diagnostics = []
 
 [dependencies]
+rustc-hash.workspace = true
 tensor4all-core = { path = "../tensor4all-core", default-features = false }
 tensor4all-simplett = { path = "../tensor4all-simplett", default-features = false, optional = true }
 tensor4all-tensorbackend = { path = "../tensor4all-tensorbackend", default-features = false }

@@ -17,7 +17,7 @@ fn evaluate_batched_uncached(
 ) -> Result<Vec<CachedScalar>> {
     let plan = RootedMessagePlan::new(evaluator.tree, center)?;
     let assignment_batches = evaluator.build_message_assignment_batches(&plan, values)?;
-    let mut messages = HashMap::<usize, StackedMessage>::new();
+    let mut messages = HashMap::<usize, StackedMessage>::default();
     for node in &plan.postorder {
         let points = assignment_batches.get(node).unwrap().first_points.clone();
         let node_message = evaluator.compute_stacked_message(
@@ -32,7 +32,7 @@ fn evaluate_batched_uncached(
         messages.insert(*node, node_message);
     }
     let mut component_batches = Vec::new();
-    let mut environment_cache = HashMap::new();
+    let mut environment_cache = HashMap::default();
     for neighbor in plan.children.get(center).cloned().unwrap_or_default() {
         let assignment_batch = assignment_batches.get(&neighbor).unwrap();
         let environment = messages.remove(&neighbor).unwrap();

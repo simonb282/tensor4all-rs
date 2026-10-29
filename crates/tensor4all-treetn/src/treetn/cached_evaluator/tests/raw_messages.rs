@@ -141,7 +141,7 @@ fn raw_leaf_message_matches_generic_contraction() {
             &leaf_points,
             &plan,
             &assignment_batches,
-            &HashMap::new(),
+            &HashMap::default(),
             &mut CachedEvaluationRoute::global(),
         )
         .unwrap();
@@ -197,7 +197,7 @@ fn raw_complex_leaf_message_matches_generic_contraction() {
             &leaf_points,
             &plan,
             &assignment_batches,
-            &HashMap::new(),
+            &HashMap::default(),
             &mut CachedEvaluationRoute::global(),
         )
         .unwrap();
@@ -251,11 +251,11 @@ fn raw_chain_message_matches_generic_contraction() {
             &leaf_points,
             &plan,
             &assignment_batches,
-            &HashMap::new(),
+            &HashMap::default(),
             &mut CachedEvaluationRoute::global(),
         )
         .unwrap();
-    let mut messages = HashMap::new();
+    let mut messages = HashMap::default();
     messages.insert(2usize, node2_message);
 
     let node1_points = assignment_batches.get(&1).unwrap().first_points.clone();
@@ -325,11 +325,11 @@ fn raw_complex_chain_message_matches_generic_contraction() {
             &leaf_points,
             &plan,
             &assignment_batches,
-            &HashMap::new(),
+            &HashMap::default(),
             &mut CachedEvaluationRoute::global(),
         )
         .unwrap();
-    let mut messages = HashMap::new();
+    let mut messages = HashMap::default();
     messages.insert(2usize, node2_message);
 
     let node1_points = assignment_batches.get(&1).unwrap().first_points.clone();
@@ -390,7 +390,7 @@ fn raw_branch_message_matches_generic_contraction() {
 
     // Nodes 2 and 3 (leaves, the hub's two children when rooted at leaf
     // 1) via the generic oracle path.
-    let mut messages = HashMap::new();
+    let mut messages = HashMap::default();
     for leaf in [2usize, 3usize] {
         let leaf_points = assignment_batches.get(&leaf).unwrap().first_points.clone();
         let leaf_message = evaluator
@@ -400,7 +400,7 @@ fn raw_branch_message_matches_generic_contraction() {
                 &leaf_points,
                 &plan,
                 &assignment_batches,
-                &HashMap::new(),
+                &HashMap::default(),
                 &mut CachedEvaluationRoute::global(),
             )
             .unwrap();
@@ -627,7 +627,7 @@ fn raw_complex_branch_message_matches_generic_contraction() {
         .build_message_assignment_batches(&plan, points)
         .unwrap();
 
-    let mut messages = HashMap::new();
+    let mut messages = HashMap::default();
     for leaf in [2usize, 3usize] {
         let leaf_points = assignment_batches.get(&leaf).unwrap().first_points.clone();
         let leaf_message = evaluator
@@ -637,7 +637,7 @@ fn raw_complex_branch_message_matches_generic_contraction() {
                 &leaf_points,
                 &plan,
                 &assignment_batches,
-                &HashMap::new(),
+                &HashMap::default(),
                 &mut CachedEvaluationRoute::global(),
             )
             .unwrap();
@@ -747,7 +747,7 @@ where
 
     // Every leaf except the centre is a child of the hub; compute those
     // through the generic oracle so only the hub's own step differs.
-    let mut messages = HashMap::new();
+    let mut messages = HashMap::default();
     for leaf in 2..=arms {
         let leaf_points = assignment_batches.get(&leaf).unwrap().first_points.clone();
         let leaf_message = evaluator
@@ -757,7 +757,7 @@ where
                 &leaf_points,
                 &plan,
                 &assignment_batches,
-                &HashMap::new(),
+                &HashMap::default(),
                 &mut CachedEvaluationRoute::global(),
             )
             .unwrap();
