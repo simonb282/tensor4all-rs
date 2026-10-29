@@ -324,8 +324,8 @@ fn component_cost_index_rejects_wrong_batch_row_count() {
 #[test]
 fn greedy_center_search_descends_to_lower_cost_neighbor() {
     let cost_index = ComponentCostIndex::from_parts_for_test(
-        HashMap::from([(0, vec![1]), (1, vec![0, 2]), (2, vec![1, 3]), (3, vec![2])]),
-        HashMap::from([(0, 40), (1, 20), (2, 10), (3, 15)]),
+        HashMap::from_iter([(0, vec![1]), (1, vec![0, 2]), (2, vec![1, 3]), (3, vec![2])]),
+        HashMap::from_iter([(0, 40), (1, 20), (2, 10), (3, 15)]),
     );
 
     let result = GreedyCenterSearch::<usize>::default()
@@ -340,13 +340,13 @@ fn greedy_center_search_descends_to_lower_cost_neighbor() {
 #[test]
 fn greedy_center_search_uses_best_of_multiple_starts() {
     let cost_index = ComponentCostIndex::from_parts_for_test(
-        HashMap::from([
+        HashMap::from_iter([
             ("a", vec!["b"]),
             ("b", vec!["a", "c"]),
             ("c", vec!["b", "d"]),
             ("d", vec!["c"]),
         ]),
-        HashMap::from([("a", 8), ("b", 6), ("c", 5), ("d", 2)]),
+        HashMap::from_iter([("a", 8), ("b", 6), ("c", 5), ("d", 2)]),
     );
 
     let result = GreedyCenterSearch::<&str>::with_max_steps(Some(1))

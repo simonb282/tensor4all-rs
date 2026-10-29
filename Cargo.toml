@@ -94,6 +94,7 @@ rand_distr = "0.5"
 rayon = "1.10"
 mpi = { version = "=0.8.1", default-features = false }
 petgraph = "0.7"
+rustc-hash = "2"
 dyn-clone = "1.0"
 omeco = "0.2.1"
 hdf5-metno = { version = "0.12", default-features = false }
