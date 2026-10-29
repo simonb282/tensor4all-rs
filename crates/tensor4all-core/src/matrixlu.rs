@@ -467,25 +467,40 @@ pub(crate) fn validate_luci_options(options: &RrLUOptions) -> Result<()> {
     Ok(())
 }
 
+/// Whether `|value|` is finite, decided without a `hypot` per entry.
+///
+/// `abs_sq` is a multiply-add. When it is finite, so is `|value|`. Only a
+/// non-finite `abs_sq` (NaN, infinity, or a square that overflows) falls back
+/// to the exact `abs_val` test, so the decision equals `abs_val().is_finite()`
+/// for every input.
+#[inline]
+fn magnitude_is_finite<T: Scalar>(value: T) -> bool {
+    value.abs_sq().is_finite() || value.abs_val().is_finite()
+}
+
+/// Whether every entry of `data` has a finite magnitude (one pass).
+fn all_magnitudes_finite<T: Scalar>(data: &[T]) -> bool {
+    data.iter().all(|&value| magnitude_is_finite(value))
+}
+
 /// Validate the entries of a column-major matrix before a factorization.
 ///
 /// NaN input returns [`MatrixCIError::NaNEncountered`]; infinite input
-/// magnitudes return [`MatrixCIError::InvalidArgument`].
+/// magnitudes return [`MatrixCIError::InvalidArgument`]. An accepted matrix
+/// costs one pass; a rejected one a second pass to tell NaN from infinity.
 pub(crate) fn validate_luci_matrix<T: Scalar>(a: &Matrix<T>) -> Result<()> {
-    if a.as_col_major_slice().iter().any(|&value| value.is_nan()) {
+    let data = a.as_col_major_slice();
+    if all_magnitudes_finite(data) {
+        return Ok(());
+    }
+    if data.iter().any(|&value| value.is_nan()) {
         return Err(MatrixCIError::NaNEncountered {
             matrix: "input".into(),
         });
     }
-    if a.as_col_major_slice()
-        .iter()
-        .any(|&value| !value.abs_val().is_finite())
-    {
-        return Err(MatrixCIError::InvalidArgument {
-            message: "input matrix magnitudes must be finite".into(),
-        });
-    }
-    Ok(())
+    Err(MatrixCIError::InvalidArgument {
+        message: "input matrix magnitudes must be finite".into(),
+    })
 }
 
 /// Validate a column-major matrix and its [`RrLUOptions`] before a factorization.
@@ -860,7 +875,24 @@ pub(crate) struct RrLULeft<T: Scalar> {
     pub(crate) pivot_magnitudes: Vec<f64>,
 }
 
+/// Factorize after checking that every input magnitude is finite.
 fn factorize_mut_in_place<T: Scalar>(
+    a: &mut Matrix<T>,
+    opts: RrLUOptions,
+) -> Result<RrLUFactorization> {
+    if !all_magnitudes_finite(a.as_col_major_slice()) {
+        return Err(MatrixCIError::NaNEncountered {
+            matrix: "input".to_string(),
+        });
+    }
+    factorize_validated_in_place(a, opts)
+}
+
+/// Factorize a matrix whose entries the caller has validated.
+///
+/// INVARIANT: every input magnitude is finite (`validate_owned_luci_input`);
+/// the elimination below still reports non-finite intermediates.
+fn factorize_validated_in_place<T: Scalar>(
     a: &mut Matrix<T>,
     opts: RrLUOptions,
 ) -> Result<RrLUFactorization> {
@@ -868,11 +900,6 @@ fn factorize_mut_in_place<T: Scalar>(
     let nc = a.ncols();
     let data = a.as_col_major_mut_slice();
     validate_col_major_matrix_len(nr, nc, data.len())?;
-    if data.iter().any(|&value| !value.abs_val().is_finite()) {
-        return Err(MatrixCIError::NaNEncountered {
-            matrix: "input".to_string(),
-        });
-    }
 
     let max_bond_dim = opts.max_bond_dim.min(nr).min(nc);
     let mut row_permutation = (0..nr).collect::<Vec<_>>();
@@ -989,7 +1016,8 @@ pub(crate) fn rrlu_left_mut<T: Scalar>(
 ) -> Result<RrLULeft<T>> {
     let mut options = options.unwrap_or_default();
     options.left_orthogonal = true;
-    let state = factorize_mut_in_place(a, options)?;
+    // INVARIANT: the caller (`matrix_luci`) validated the input.
+    let state = factorize_validated_in_place(a, options)?;
     let nrows = a.nrows();
     let data = a.as_col_major_slice();
     let mut pivot_magnitudes = (0..state.n_pivot)
@@ -1169,7 +1197,7 @@ pub fn rrlu_pivots<T: Scalar>(
     let opts = options.unwrap_or_default();
     let rank_cap = opts.max_bond_dim;
     validate_owned_luci_input(&a, &opts)?;
-    let state = factorize_mut_in_place(&mut a, opts)?;
+    let state = factorize_validated_in_place(&mut a, opts)?;
     let pivot_errors = pivot_errors_from_factorization(&a, &state, rank_cap)?;
     Ok(RrLUPivots {
         row_indices: state.row_permutation[..state.n_pivot].to_vec(),

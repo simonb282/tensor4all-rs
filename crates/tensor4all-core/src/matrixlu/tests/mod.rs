@@ -537,3 +537,67 @@ fn rrlu_pivots_matches_the_full_factorization() {
     check::<f32>();
     check::<Complex64>();
 }
+
+/// Input validation accepts and rejects the same entries, with the same error
+/// kinds, as the former three passes (`is_nan`, then `abs_val().is_finite()`
+/// in the validator, then again in the factorization).
+#[test]
+fn input_validation_decisions_and_error_kinds() {
+    use crate::MatrixCIError::{InvalidArgument, NaNEncountered};
+
+    fn matrix<T: Scalar>(bad: T) -> Matrix<T> {
+        let one = T::from_f64(1.0);
+        from_vec2d(vec![vec![one, bad], vec![T::from_f64(2.0), one]])
+    }
+
+    fn check_rejected<T: Scalar + std::fmt::Debug>(bad: T, nan: bool) {
+        let m = matrix(bad);
+        let validated = validate_luci_matrix(&m).unwrap_err();
+        let pivots = rrlu_pivots(m.clone(), None).unwrap_err();
+        let full = rrlu(&m, None).unwrap_err();
+        if nan {
+            assert!(matches!(validated, NaNEncountered { ref matrix } if matrix == "input"));
+            assert!(matches!(pivots, NaNEncountered { ref matrix } if matrix == "input"));
+        } else {
+            assert!(matches!(validated, InvalidArgument { .. }));
+            assert!(matches!(pivots, InvalidArgument { .. }));
+        }
+        // The factorization itself reports every non-finite entry as NaN.
+        assert!(matches!(full, NaNEncountered { ref matrix } if matrix == "input"));
+    }
+
+    check_rejected(f64::NAN, true);
+    check_rejected(f64::INFINITY, false);
+    check_rejected(f64::NEG_INFINITY, false);
+    check_rejected(f32::NAN, true);
+    check_rejected(f32::INFINITY, false);
+    check_rejected(Complex64::new(f64::NAN, 0.0), true);
+    check_rejected(Complex64::new(0.0, f64::NAN), true);
+    check_rejected(Complex64::new(f64::INFINITY, 0.0), false);
+    check_rejected(Complex64::new(0.0, f64::NEG_INFINITY), false);
+    // Both components finite, but |z| overflows: rejected as before.
+    check_rejected(Complex64::new(1.5e308, 1.5e308), false);
+    check_rejected(Complex64::new(f64::MAX, f64::MAX), false);
+    // NaN wins over an infinity elsewhere in the matrix.
+    let mixed = from_vec2d(vec![
+        vec![Complex64::new(f64::INFINITY, 0.0), Complex64::new(1.0, 0.0)],
+        vec![Complex64::new(0.0, f64::NAN), Complex64::new(1.0, 0.0)],
+    ]);
+    assert!(matches!(
+        validate_luci_matrix(&mixed),
+        Err(NaNEncountered { .. })
+    ));
+
+    // |z|^2 overflows but |z| is finite: accepted, as before.
+    for ok in [
+        Complex64::new(1e308, 1e308),
+        Complex64::new(f64::MAX, 0.0),
+        Complex64::new(0.0, -f64::MAX),
+        Complex64::new(1e200, 1e200),
+    ] {
+        assert!(validate_luci_matrix(&matrix(ok)).is_ok(), "{ok:?}");
+    }
+    assert!(validate_luci_matrix(&matrix(f64::MAX)).is_ok());
+    assert!(validate_luci_matrix(&matrix(f32::MAX)).is_ok());
+    assert!(validate_luci_matrix(&matrix(1e30_f32)).is_ok());
+}
