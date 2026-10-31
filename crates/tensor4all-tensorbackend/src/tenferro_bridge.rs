@@ -814,11 +814,19 @@ fn cached_einsum_native_reads(
     subscripts: &Subscripts,
 ) -> Result<NativeTensor> {
     let einsum_subscripts = EinsumSubscripts::from(subscripts);
+    execute_native_einsum_reads(inputs, subscripts, &einsum_subscripts)
+}
+
+fn execute_native_einsum_reads(
+    inputs: &[TensorRead<'_>],
+    subscripts: &Subscripts,
+    einsum_subscripts: &EinsumSubscripts,
+) -> Result<NativeTensor> {
     if inputs.first().is_some_and(|first| {
         concrete_einsum_dtype_supported(first.dtype())
             && inputs.iter().all(|input| input.dtype() == first.dtype())
     }) {
-        let plan = cached_concrete_einsum_plan(inputs, subscripts, &einsum_subscripts)?;
+        let plan = cached_concrete_einsum_plan(inputs, subscripts, einsum_subscripts)?;
         // The plan reports `tenferro_einsum::Error`, so the session-entry
         // rejection is mapped here rather than through the tenferro-tensor-typed
         // session helper.
@@ -831,7 +839,7 @@ fn cached_einsum_native_reads(
     }
 
     run_cached_native_einsum(
-        &einsum_subscripts,
+        einsum_subscripts,
         |compiler| {
             compile_native_einsum_program(
                 compiler,
@@ -841,7 +849,7 @@ fn cached_einsum_native_reads(
                         tensor.shape().iter().copied().map(Into::into),
                     )
                 }),
-                &einsum_subscripts,
+                einsum_subscripts,
             )
         },
         |context, program| single_output(context.run_graph_reads(program, inputs)),
@@ -1761,32 +1769,109 @@ pub fn einsum_native_subscripts(
     subscripts: &str,
     operands: &[&NativeTensor],
 ) -> Result<NativeTensor> {
-    let parsed = Subscripts::parse(subscripts)
-        .map_err(|error| anyhow!("invalid einsum subscripts '{subscripts}': {error}"))?;
-    ensure!(
-        parsed.inputs.len() == operands.len(),
-        "einsum subscripts '{subscripts}' describe {} input term(s) but {} operand(s) were given",
-        parsed.inputs.len(),
-        operands.len()
-    );
+    let plan = NativeEinsumPlan::new(subscripts)?;
+    let reads = operands
+        .iter()
+        .map(|tensor| TensorRead::from_tensor(tensor))
+        .collect::<Vec<_>>();
+    plan.execute_reads(&reads)
+}
 
-    let input_ids = parsed
-        .inputs
-        .iter()
-        .map(|ids| ids.iter().map(|&id| id as usize).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    let output_ids = parsed
-        .output
-        .iter()
-        .map(|&id| id as usize)
-        .collect::<Vec<_>>();
-    let operand_refs = operands
-        .iter()
-        .zip(input_ids.iter())
-        .map(|(tensor, ids)| (*tensor, ids.as_slice()))
-        .collect::<Vec<_>>();
+/// A parsed einsum specification reusable across operand shapes and borrowed buffers.
+///
+/// The specification is parsed once; shape-specific owning execution plans are
+/// prepared and cached by the backend. This is the minimal parsed-plan bridge
+/// for <https://github.com/tensor4all/tensor4all-rs/issues/1065>.
+/// Unlike an operand-bound concrete plan, this specification accepts new shapes.
+///
+/// # Examples
+///
+/// ```
+/// use tensor4all_tensorbackend::NativeEinsumPlan;
+/// use tenferro_tensor::{Tensor, TensorRead};
+/// # fn main() -> anyhow::Result<()> {
+/// let plan = NativeEinsumPlan::new("i->")?;
+/// for (data, expected) in [(vec![1.0_f64, 2.0], 3.0), (vec![1.0, 2.0, 3.0], 6.0)] {
+///     let operand = Tensor::from_vec_col_major([data.len()], data)?;
+///     let sum = plan.execute_reads(&[TensorRead::from_tensor(&operand)])?;
+///     assert_eq!(sum.as_slice::<f64>()?, &[expected]);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct NativeEinsumPlan {
+    subscripts: Subscripts,
+    einsum_subscripts: EinsumSubscripts,
+}
 
-    einsum_native_tensors(&operand_refs, &output_ids)
+impl NativeEinsumPlan {
+    /// Parse a fixed einsum expression without binding operand shapes or storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid subscripts, such as a missing explicit output term.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tensor4all_tensorbackend::NativeEinsumPlan;
+    /// let error = NativeEinsumPlan::new("ij,jk").unwrap_err();
+    /// assert!(error.to_string().contains("invalid einsum subscripts"));
+    /// ```
+    pub fn new(subscripts: &str) -> Result<Self> {
+        let parsed = Subscripts::parse(subscripts)
+            .map_err(|error| anyhow!("invalid einsum subscripts '{subscripts}': {error}"))?;
+        let einsum_subscripts = EinsumSubscripts::from(&parsed);
+        Ok(Self {
+            subscripts: parsed,
+            einsum_subscripts,
+        })
+    }
+
+    /// Execute the parsed expression on borrowed inputs without copying them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty inputs, operand-count or rank mismatches,
+    /// incompatible label extents, or a backend execution failure. Mixed dtypes
+    /// retain the promotion performed by the native einsum graph.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tensor4all_tensorbackend::NativeEinsumPlan;
+    /// use tenferro_tensor::{Tensor, TensorRead};
+    /// # fn main() -> anyhow::Result<()> {
+    /// let plan = NativeEinsumPlan::new("i,i->")?;
+    /// let lhs = Tensor::from_vec_col_major([2], vec![1.0_f64, 2.0])?;
+    /// let rhs = Tensor::from_vec_col_major([2], vec![3.0_f64, 4.0])?;
+    /// let dot = plan.execute_reads(&[TensorRead::from_tensor(&lhs), TensorRead::from_tensor(&rhs)])?;
+    /// assert_eq!(dot.as_slice::<f64>()?, &[11.0]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn execute_reads(&self, inputs: &[TensorRead<'_>]) -> Result<NativeTensor> {
+        ensure!(
+            self.subscripts.inputs.len() == inputs.len(),
+            "einsum subscripts describe {} input term(s) but {} operand(s) were given",
+            self.subscripts.inputs.len(),
+            inputs.len()
+        );
+        ensure!(
+            !inputs.is_empty(),
+            "native einsum requires at least one operand"
+        );
+        for (tensor, ids) in inputs.iter().zip(&self.subscripts.inputs) {
+            ensure!(
+                tensor.shape().len() == ids.len(),
+                "einsum id list {:?} does not match tensor shape {:?}",
+                ids,
+                tensor.shape()
+            );
+        }
+        execute_native_einsum_reads(inputs, &self.subscripts, &self.einsum_subscripts)
+    }
 }
 
 /// Execute a cached einsum over read-only native tensor inputs.
