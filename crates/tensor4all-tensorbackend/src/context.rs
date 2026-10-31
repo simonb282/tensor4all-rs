@@ -406,8 +406,9 @@ static DEFAULT_CPU_WAIT_POLICY: OnceLock<CpuWaitPolicy> = OnceLock::new();
 ///
 /// # Errors
 ///
-/// Returns [`WaitPolicyAlreadyInitialized`] when an earlier call already set it;
-/// the first value stays. Build a backend with
+/// Returns [`WaitPolicyAlreadyInitialized`] when the process-wide wait-policy
+/// configuration was already fixed by an earlier call, so a change is
+/// unsupported and the first value stays. Build a backend with
 /// [`CpuBackend::with_threads_and_wait_policy`] to use another policy for one
 /// backend.
 ///
@@ -753,7 +754,7 @@ impl CpuBackend {
     ///
     /// # Errors
     ///
-    /// The same as [`CpuBackend::with_threads`].
+    /// The same errors as [`CpuBackend::with_threads`].
     ///
     /// # Examples
     ///
